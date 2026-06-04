@@ -421,17 +421,22 @@ jobs:
       # ============================================
       # 9. Package with AnyKernel3
       # ============================================
+      # ============================================
+      # 9. Package with AnyKernel3
+      # ============================================
       - name: "📦 Package with AnyKernel3"
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cd AnyKernel3
           rm -rf ramdisk patch README.md .git .github
 
-          cat > anykernel.sh << 'EOF'
+          # Write anykernel.sh with NO leading spaces
+          cat > anykernel.sh << 'AKEOF'
           # AnyKernel3 Ramdisk Mod Script
           # osm0sis @ xda-developers
 
           ## AnyKernel setup
+          # begin properties
           properties() { '
           kernel.string=SukiSU-Ultra Kernel for Xiaomi 11 Lite NE 5G (lisa)
           do.devicecheck=1
@@ -447,18 +452,25 @@ jobs:
           supported.vendorpatchlevels=
           '; }
 
+          # shell variables
           BLOCK=/dev/block/bootdevice/by-name/boot;
           IS_SLOT_DEVICE=1;
           RAMDISK_COMPRESSION=auto;
           PATCH_VBMETA_FLAG=auto;
 
+          ## AnyKernel methods (DO NOT CHANGE)
           . tools/ak3-core.sh;
 
-          set_perm_recursive 0 0 755 644 $ramdisk/*;
+          ## AnyKernel boot install
           dump_boot;
           write_boot;
-          EOF
+          ## end boot install
+          AKEOF
 
+          # Strip leading whitespace from heredoc (YAML indentation artifact)
+          sed -i 's/^          //' anykernel.sh
+
+          # Copy kernel image
           if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image" ]; then
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image .
           elif [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz" ]; then
@@ -467,15 +479,26 @@ jobs:
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb .
           fi
 
+          # Copy DTBs if available
           mkdir -p dtbs
           if [ -d "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom" ]; then
             find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom \
               -name "*.dtb" -exec cp {} dtbs/ \; 2>/dev/null || true
           fi
 
+          # Copy DTBO if available
           if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img" ]; then
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img .
           fi
+
+          # Verify anykernel.sh content
+          echo "📋 anykernel.sh content:"
+          cat -A anykernel.sh | head -20
+          echo "---"
+
+          # Verify kernel image is present
+          echo "📋 Files in AnyKernel3 zip:"
+          ls -la Image* dtb* 2>/dev/null || echo "⚠️ No kernel image found!"
 
           ZIPNAME="SukiSU-Ultra-lisa-${{ env.KERNEL_VERSION }}-$(date +%Y%m%d).zip"
           zip -r9 "../$ZIPNAME" * -x '*.git*'
