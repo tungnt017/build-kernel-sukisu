@@ -83,7 +83,7 @@ jobs:
           df -h /
 
       # ============================================
-      # 2. Install dependencies (Ubuntu 24.04 compatible)
+      # 2. Install dependencies
       # ============================================
       - name: "📦 Install build dependencies"
         run: |
@@ -93,7 +93,7 @@ jobs:
             zlib1g-dev libc6-dev-i386 libncurses6 libncurses-dev \
             lib32ncurses-dev lib32z1-dev \
             x11proto-core-dev libx11-dev libgl1-mesa-dev \
-            libxml2-utils xsltproc unzip fontconfig python3 \
+            libxml2-utils xsltproc unzip fontconfig python3 python3-pip \
             bc cpio kmod libelf-dev libssl-dev \
             lld llvm
 
@@ -143,38 +143,38 @@ jobs:
           fi
 
       # ============================================
-      # 5.1. Source-level fix: qcacld-3.0 header
+      # 5.1. Source fix: qcacld-3.0 header
       # ============================================
       - name: "🩹 Fix qcacld-3.0 header mismatch"
         working-directory: kernel_source
         run: |
-          echo "🩹 Fixing -Warray-parameter mismatch in qcacld-3.0 header..."
+          echo "🩹 Fixing -Warray-parameter in qcacld-3.0 header..."
           HEADER="drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h"
           if [ -f "$HEADER" ]; then
             sed -i 's/uint8_t mdie\[\]/uint8_t mdie[SIR_MDIE_SIZE]/' "$HEADER"
-            echo "✅ Patched $HEADER: mdie[] -> mdie[SIR_MDIE_SIZE]"
+            echo "✅ Patched $HEADER"
           else
             echo "⏭️ $HEADER not found, skipping"
           fi
 
       # ============================================
-      # 5.2. Source-level fix: rmnet_ipa.c enum casts
+      # 5.2. Source fix: rmnet_ipa.c enum casts
       # ============================================
       - name: "🩹 Fix rmnet_ipa.c enum type casts"
         working-directory: kernel_source
         run: |
-          echo "🩹 Fixing implicit enum conversions in rmnet_ipa.c..."
+          echo "🩹 Fixing enum conversions in rmnet_ipa.c..."
           FILE="techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c"
           if [ -f "$FILE" ]; then
             sed -i 's/q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;/q6_ul_flt_rule_ptr->ip = (enum ipa_ip_type)flt_spec_ptr->ip_type;/' "$FILE"
             sed -i 's/q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;/q6_ul_flt_rule_ptr->action = (enum ipa_flt_action)flt_spec_ptr->filter_action;/' "$FILE"
-            echo "✅ Patched $FILE with explicit enum casts"
+            echo "✅ Patched $FILE"
           else
             echo "⏭️ $FILE not found, skipping"
           fi
 
       # ============================================
-      # 5.3. Source-level fix: sde_hw_dsc_1_2.c
+      # 5.3. Source fix: sde_hw_dsc_1_2.c
       # ============================================
       - name: "🩹 Fix sde_hw_dsc_1_2.c missing return type"
         working-directory: kernel_source
@@ -183,7 +183,7 @@ jobs:
           FILE="techpack/display/msm/sde/sde_hw_dsc_1_2.c"
           if [ -f "$FILE" ]; then
             sed -i 's/^static inline _dsc_subblk_offset/static inline int _dsc_subblk_offset/' "$FILE"
-            echo "✅ Patched $FILE: added 'int' return type to _dsc_subblk_offset()"
+            echo "✅ Patched $FILE"
           else
             echo "⏭️ $FILE not found, skipping"
           fi
@@ -196,36 +196,40 @@ jobs:
         run: |
           echo "🩹 Applying global Clang 15 warning suppression flags..."
 
-          # --- Fix ALL common Clang 15 -Werror warnings across techpacks ---
+          CLANG15_FLAGS=(
+            "-Wno-error=enum-conversion"
+            "-Wno-error=unused-but-set-variable"
+            "-Wno-error=implicit-int"
+            "-Wno-error=implicit-function-declaration"
+            "-Wno-error=sometimes-uninitialized"
+            "-Wno-error=int-conversion"
+          )
+
           if [ -d "techpack" ]; then
             find techpack/ -name "Makefile" -o -name "Kbuild" | while read f; do
-              for flag in \
-                "-Wno-error=enum-conversion" \
-                "-Wno-error=unused-but-set-variable" \
-                "-Wno-error=implicit-int" \
-                "-Wno-error=implicit-function-declaration" \
-                "-Wno-error=sometimes-uninitialized" \
-                "-Wno-error=int-conversion"; do
+              for flag in "${CLANG15_FLAGS[@]}"; do
                 if ! grep -q -- "$flag" "$f"; then
                   echo "ccflags-y += $flag" >> "$f"
                 fi
               done
             done
-            echo "✅ Patched techpack/ Makefiles/Kbuilds"
+            echo "✅ Patched techpack/"
           fi
 
-          # --- Fix -Werror=array-parameter across staging drivers ---
+          STAGING_FLAGS=(
+            "-Wno-error=array-parameter"
+            "-Wno-error=unused-but-set-variable"
+          )
+
           if [ -d "drivers/staging" ]; then
             find drivers/staging/ -name "Kbuild" -o -name "Makefile" | while read f; do
-              for flag in \
-                "-Wno-error=array-parameter" \
-                "-Wno-error=unused-but-set-variable"; do
+              for flag in "${STAGING_FLAGS[@]}"; do
                 if ! grep -q -- "$flag" "$f"; then
                   echo "ccflags-y += $flag" >> "$f"
                 fi
               done
             done
-            echo "✅ Patched drivers/staging/ Kbuilds"
+            echo "✅ Patched drivers/staging/"
           fi
 
           echo "✅ Global Clang 15 compat patches applied!"
@@ -338,13 +342,11 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             ${{ github.event.inputs.KERNEL_DEFCONFIG }}
 
-          # Inject SukiSU configs
           echo "" >> out/.config
           echo "# SukiSU-Ultra configs" >> out/.config
           echo "CONFIG_KSU=y" >> out/.config
           echo "# CONFIG_KSU_SUSFS is not set" >> out/.config
 
-          # Hook method config
           if [ "${{ github.event.inputs.HOOK_METHOD }}" = "manual" ]; then
             echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
             echo "# CONFIG_KPROBES is not set" >> out/.config
@@ -354,14 +356,12 @@ jobs:
             echo "CONFIG_KPROBE_EVENTS=y" >> out/.config
           fi
 
-          # KPM support
           if [ "${{ github.event.inputs.ENABLE_KPM }}" = "true" ]; then
             echo "CONFIG_KPM=y" >> out/.config
             echo "CONFIG_KALLSYMS=y" >> out/.config
             echo "CONFIG_KALLSYMS_ALL=y" >> out/.config
           fi
 
-          # Disable LTO if requested
           if [ "${{ github.event.inputs.DISABLE_LTO }}" = "true" ]; then
             sed -i 's/CONFIG_LTO=y/# CONFIG_LTO is not set/g' out/.config
             sed -i 's/CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/g' out/.config
@@ -369,7 +369,6 @@ jobs:
             echo "CONFIG_LTO_NONE=y" >> out/.config
           fi
 
-          # Refresh config
           make -j$(nproc) O=out ARCH=arm64 \
             CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
@@ -419,10 +418,109 @@ jobs:
           fi
 
       # ============================================
-      # 9. Package with AnyKernel3
+      # 9. Create boot.img with magiskboot
       # ============================================
+      - name: "🥾 Create flashable boot.img"
+        run: |
+          echo "🥾 Creating boot.img using magiskboot..."
+
+          # --- Download magiskboot ---
+          MAGISKBOOT_URL="https://github.com/nicholaschum/magiskboot_build/releases/latest/download/magiskboot-x86_64"
+          mkdir -p $GITHUB_WORKSPACE/tools
+          wget -q "$MAGISKBOOT_URL" -O $GITHUB_WORKSPACE/tools/magiskboot || {
+            echo "⚠️ magiskboot download failed, trying alternative..."
+            MAGISKBOOT_URL="https://github.com/AviraxP/magiskboot_build/releases/latest/download/magiskboot-x86_64"
+            wget -q "$MAGISKBOOT_URL" -O $GITHUB_WORKSPACE/tools/magiskboot
+          }
+          chmod +x $GITHUB_WORKSPACE/tools/magiskboot
+          MAGISKBOOT="$GITHUB_WORKSPACE/tools/magiskboot"
+
+          # --- Download stock boot.img for lisa (PixelExperience Android 13) ---
+          # We need the stock boot.img to extract ramdisk, then replace kernel
+          # Alternative: use mkbootimg with empty ramdisk for header v3
+          echo "📥 Setting up mkbootimg..."
+          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg $GITHUB_WORKSPACE/tools/mkbootimg
+
+          MKBOOTIMG="$GITHUB_WORKSPACE/tools/mkbootimg/mkbootimg.py"
+          UNPACK_BOOTIMG="$GITHUB_WORKSPACE/tools/mkbootimg/unpack_bootimg.py"
+
+          # --- Determine kernel image path ---
+          KERNEL_IMG=""
+          if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image" ]; then
+            KERNEL_IMG="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image"
+          elif [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz" ]; then
+            KERNEL_IMG="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz"
+          elif [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb" ]; then
+            KERNEL_IMG="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb"
+          fi
+
+          echo "📋 Kernel image: $KERNEL_IMG ($(du -h "$KERNEL_IMG" | cut -f1))"
+
+          # --- Collect DTB files ---
+          DTB_FILE=""
+          DTB_DIR="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom"
+          if [ -d "$DTB_DIR" ]; then
+            DTB_COUNT=$(find "$DTB_DIR" -name "*.dtb" | wc -l)
+            if [ "$DTB_COUNT" -gt 0 ]; then
+              # Concatenate all DTBs into one file
+              find "$DTB_DIR" -name "*.dtb" -exec cat {} + > $GITHUB_WORKSPACE/dtb.img
+              DTB_FILE="$GITHUB_WORKSPACE/dtb.img"
+              echo "✅ Combined $DTB_COUNT DTB files into dtb.img"
+            fi
+          fi
+
+          # --- Collect DTBO ---
+          DTBO_FILE=""
+          if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img" ]; then
+            DTBO_FILE="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img"
+            echo "✅ Found dtbo.img"
+          fi
+
+          # --- Create empty ramdisk ---
+          # Lisa with Android 13 uses boot header v3+
+          # Ramdisk is in vendor_boot, so boot.img ramdisk can be empty
+          mkdir -p /tmp/empty_ramdisk
+          cd /tmp/empty_ramdisk
+          mkdir -p proc sys dev
+          find . | cpio -o -H newc 2>/dev/null | gzip > $GITHUB_WORKSPACE/ramdisk.cpio.gz
+          cd $GITHUB_WORKSPACE
+
+          # --- Build boot.img ---
+          # Lisa (SM7325/yupik) PixelExperience Android 13 uses header v3
+          CMDLINE="console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 androidboot.memcg=1 lpm_levels.sleep_disabled=1 msm_rtb.filter=0x237 service_locator.enable=1 androidboot.usbcontroller=a600000.dwc3 swiotlb=0 loop.max_part=7 cgroup.memory=nokmem,nosocket iptable_raw.raw_before_defrag=1 ip6table_raw.raw_before_defrag=1 firmware_class.path=/vendor/firmware"
+
+          echo "🔨 Creating boot.img (header v3)..."
+          python3 $MKBOOTIMG \
+            --header_version 3 \
+            --kernel "$KERNEL_IMG" \
+            --ramdisk "$GITHUB_WORKSPACE/ramdisk.cpio.gz" \
+            --cmdline "$CMDLINE" \
+            --os_version 13.0.0 \
+            --os_patch_level 2023-10 \
+            --output "$GITHUB_WORKSPACE/boot.img"
+
+          if [ -f "$GITHUB_WORKSPACE/boot.img" ]; then
+            echo "✅ boot.img created successfully!"
+            ls -lh "$GITHUB_WORKSPACE/boot.img"
+            echo "BOOT_IMG=$GITHUB_WORKSPACE/boot.img" >> $GITHUB_ENV
+          else
+            echo "❌ boot.img creation failed!"
+            exit 1
+          fi
+
+          # --- Also create dtbo.img artifact if available ---
+          if [ -n "$DTBO_FILE" ]; then
+            cp "$DTBO_FILE" "$GITHUB_WORKSPACE/dtbo.img"
+            echo "DTBO_IMG=$GITHUB_WORKSPACE/dtbo.img" >> $GITHUB_ENV
+          fi
+
+          # --- Also export dtb.img if available ---
+          if [ -n "$DTB_FILE" ]; then
+            echo "DTB_IMG=$DTB_FILE" >> $GITHUB_ENV
+          fi
+
       # ============================================
-      # 9. Package with AnyKernel3
+      # 10. Package with AnyKernel3
       # ============================================
       - name: "📦 Package with AnyKernel3"
         run: |
@@ -430,8 +528,7 @@ jobs:
           cd AnyKernel3
           rm -rf ramdisk patch README.md .git .github
 
-          # Write anykernel.sh with NO leading spaces
-          cat > anykernel.sh << 'AKEOF'
+          cat > anykernel.sh <<'AKEOF'
           # AnyKernel3 Ramdisk Mod Script
           # osm0sis @ xda-developers
 
@@ -467,7 +564,6 @@ jobs:
           ## end boot install
           AKEOF
 
-          # Strip leading whitespace from heredoc (YAML indentation artifact)
           sed -i 's/^          //' anykernel.sh
 
           # Copy kernel image
@@ -479,26 +575,20 @@ jobs:
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb .
           fi
 
-          # Copy DTBs if available
+          # Copy DTBs
           mkdir -p dtbs
           if [ -d "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom" ]; then
             find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom \
               -name "*.dtb" -exec cp {} dtbs/ \; 2>/dev/null || true
           fi
 
-          # Copy DTBO if available
+          # Copy DTBO
           if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img" ]; then
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img .
           fi
 
-          # Verify anykernel.sh content
-          echo "📋 anykernel.sh content:"
-          cat -A anykernel.sh | head -20
-          echo "---"
-
-          # Verify kernel image is present
-          echo "📋 Files in AnyKernel3 zip:"
-          ls -la Image* dtb* 2>/dev/null || echo "⚠️ No kernel image found!"
+          echo "📋 Files in AnyKernel3:"
+          ls -la Image* dtb* 2>/dev/null || true
 
           ZIPNAME="SukiSU-Ultra-lisa-${{ env.KERNEL_VERSION }}-$(date +%Y%m%d).zip"
           zip -r9 "../$ZIPNAME" * -x '*.git*'
@@ -507,13 +597,28 @@ jobs:
           ls -lh "../$ZIPNAME"
 
       # ============================================
-      # 10. Upload artifacts
+      # 11. Upload artifacts
       # ============================================
       - name: "📤 Upload AnyKernel3 zip"
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ZIP_NAME }}
           path: ${{ env.ZIP_NAME }}
+          retention-days: 7
+
+      - name: "📤 Upload boot.img"
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-img-lisa-sukisu
+          path: ${{ env.BOOT_IMG }}
+          retention-days: 7
+
+      - name: "📤 Upload dtbo.img"
+        if: env.DTBO_IMG != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtbo-img-lisa
+          path: ${{ env.DTBO_IMG }}
           retention-days: 7
 
       - name: "📤 Upload kernel image"
@@ -532,7 +637,7 @@ jobs:
           retention-days: 3
 
       # ============================================
-      # 11. Create GitHub Release
+      # 12. Create GitHub Release
       # ============================================
       - name: "🚀 Create GitHub Release"
         if: success()
@@ -552,10 +657,32 @@ jobs:
             | **KPM** | ${{ github.event.inputs.ENABLE_KPM }} |
             | **Clang** | ZyC 15.0.7 |
 
+            ### 📦 Downloads
+            | File | Usage |
+            |---|---|
+            | `SukiSU-Ultra-lisa-*.zip` | Flash via TWRP/Recovery |
+            | `boot.img` | Flash via `fastboot flash boot boot.img` |
+            | `dtbo.img` | Flash via `fastboot flash dtbo dtbo.img` (if needed) |
+
             ### ⚡ Flash Instructions
+
+            **Method 1 — Recovery (AnyKernel3):**
             1. Boot into TWRP / custom recovery
-            2. Flash the AnyKernel3 zip
+            2. Flash the `SukiSU-Ultra-lisa-*.zip`
             3. Reboot & install SukiSU-Ultra Manager
-          files: ${{ env.ZIP_NAME }}
+
+            **Method 2 — Fastboot (boot.img):**
+            1. Reboot to bootloader: `adb reboot bootloader`
+            2. Flash boot image: `fastboot flash boot boot.img`
+            3. (Optional) Flash dtbo: `fastboot flash dtbo dtbo.img`
+            4. Reboot: `fastboot reboot`
+            5. Install SukiSU-Ultra Manager
+
+            > ⚠️ **Tip:** Test first with `fastboot boot boot.img` (temporary boot) before permanent flash.
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.BOOT_IMG }}
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
