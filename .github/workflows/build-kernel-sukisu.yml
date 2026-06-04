@@ -125,7 +125,7 @@ jobs:
           $GITHUB_WORKSPACE/toolchains/clang/bin/clang --version
 
       # ============================================
-      # 5. Integrate SukiSU-Ultra (main branch, no SUSFS)
+      # 5. Integrate SukiSU-Ultra
       # ============================================
       - name: "🔐 Integrate SukiSU-Ultra"
         working-directory: kernel_source
@@ -143,7 +143,7 @@ jobs:
           fi
 
       # ============================================
-      # 5.1. Fix qcacld-3.0 header (source-level patch)
+      # 5.1. Source-level fix: qcacld-3.0 header
       # ============================================
       - name: "🩹 Fix qcacld-3.0 header mismatch"
         working-directory: kernel_source
@@ -158,7 +158,7 @@ jobs:
           fi
 
       # ============================================
-      # 5.2. Fix rmnet_ipa.c enum casts (source-level patch)
+      # 5.2. Source-level fix: rmnet_ipa.c enum casts
       # ============================================
       - name: "🩹 Fix rmnet_ipa.c enum type casts"
         working-directory: kernel_source
@@ -166,56 +166,66 @@ jobs:
           echo "🩹 Fixing implicit enum conversions in rmnet_ipa.c..."
           FILE="techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c"
           if [ -f "$FILE" ]; then
-            # Cast ipa_ip_type_enum_v01 -> ipa_ip_type
             sed -i 's/q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;/q6_ul_flt_rule_ptr->ip = (enum ipa_ip_type)flt_spec_ptr->ip_type;/' "$FILE"
-
-            # Cast ipa_filter_action_enum_v01 -> ipa_flt_action
             sed -i 's/q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;/q6_ul_flt_rule_ptr->action = (enum ipa_flt_action)flt_spec_ptr->filter_action;/' "$FILE"
-
             echo "✅ Patched $FILE with explicit enum casts"
           else
             echo "⏭️ $FILE not found, skipping"
           fi
 
       # ============================================
-      # 5.3. Global Clang 15 compatibility flag patches
+      # 5.3. Source-level fix: sde_hw_dsc_1_2.c
+      # ============================================
+      - name: "🩹 Fix sde_hw_dsc_1_2.c missing return type"
+        working-directory: kernel_source
+        run: |
+          echo "🩹 Fixing -Wimplicit-int in sde_hw_dsc_1_2.c..."
+          FILE="techpack/display/msm/sde/sde_hw_dsc_1_2.c"
+          if [ -f "$FILE" ]; then
+            sed -i 's/^static inline _dsc_subblk_offset/static inline int _dsc_subblk_offset/' "$FILE"
+            echo "✅ Patched $FILE: added 'int' return type to _dsc_subblk_offset()"
+          else
+            echo "⏭️ $FILE not found, skipping"
+          fi
+
+      # ============================================
+      # 5.4. Global Clang 15 compat flag patches
       # ============================================
       - name: "🩹 Global Clang 15 compat patches"
         working-directory: kernel_source
         run: |
           echo "🩹 Applying global Clang 15 warning suppression flags..."
 
-          PATCHED=0
-
-          # --- Fix -Werror=enum-conversion across ALL techpacks ---
+          # --- Fix ALL common Clang 15 -Werror warnings across techpacks ---
           if [ -d "techpack" ]; then
             find techpack/ -name "Makefile" -o -name "Kbuild" | while read f; do
-              if ! grep -q "Wno-error=enum-conversion" "$f"; then
-                echo 'ccflags-y += -Wno-error=enum-conversion' >> "$f"
-                echo "  ✅ Patched: $f (enum-conversion)"
-              fi
+              for flag in \
+                "-Wno-error=enum-conversion" \
+                "-Wno-error=unused-but-set-variable" \
+                "-Wno-error=implicit-int" \
+                "-Wno-error=implicit-function-declaration" \
+                "-Wno-error=sometimes-uninitialized" \
+                "-Wno-error=int-conversion"; do
+                if ! grep -q -- "$flag" "$f"; then
+                  echo "ccflags-y += $flag" >> "$f"
+                fi
+              done
             done
+            echo "✅ Patched techpack/ Makefiles/Kbuilds"
           fi
 
           # --- Fix -Werror=array-parameter across staging drivers ---
           if [ -d "drivers/staging" ]; then
             find drivers/staging/ -name "Kbuild" -o -name "Makefile" | while read f; do
-              if ! grep -q "Wno-error=array-parameter" "$f"; then
-                echo 'ccflags-y += -Wno-error=array-parameter' >> "$f"
-                echo "  ✅ Patched: $f (array-parameter)"
-              fi
+              for flag in \
+                "-Wno-error=array-parameter" \
+                "-Wno-error=unused-but-set-variable"; do
+                if ! grep -q -- "$flag" "$f"; then
+                  echo "ccflags-y += $flag" >> "$f"
+                fi
+              done
             done
-          fi
-
-          # --- Additional: Fix common Clang 15 warnings in techpack ---
-          # -Wunused-but-set-variable (common in older Qualcomm code)
-          # -Wbitfield-constant-conversion
-          if [ -d "techpack" ]; then
-            find techpack/ -name "Makefile" -o -name "Kbuild" | while read f; do
-              if ! grep -q "Wno-error=unused-but-set-variable" "$f"; then
-                echo 'ccflags-y += -Wno-error=unused-but-set-variable' >> "$f"
-              fi
-            done
+            echo "✅ Patched drivers/staging/ Kbuilds"
           fi
 
           echo "✅ Global Clang 15 compat patches applied!"
