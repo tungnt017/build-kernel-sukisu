@@ -51,9 +51,9 @@ jobs:
       # ============================================
       # 1. Aggressive disk cleanup
       # ============================================
-      - name: "\U0001F9F9 Free disk space"
+      - name: "🧹 Free disk space"
         run: |
-          echo "\U0001F9F9 Before cleanup:"
+          echo "🧹 Before cleanup:"
           df -h /
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
@@ -79,13 +79,13 @@ jobs:
           sudo docker image prune --all --force 2>/dev/null || true
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
-          echo "\u2705 After cleanup:"
+          echo "✅ After cleanup:"
           df -h /
 
       # ============================================
       # 2. Install dependencies (Ubuntu 24.04 compatible)
       # ============================================
-      - name: "\U0001F4E6 Install build dependencies"
+      - name: "📦 Install build dependencies"
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -100,7 +100,7 @@ jobs:
       # ============================================
       # 3. Clone kernel source
       # ============================================
-      - name: "\U0001F4E5 Clone kernel source"
+      - name: "📥 Clone kernel source"
         run: |
           git clone --depth=1 \
             -b ${{ github.event.inputs.KERNEL_BRANCH }} \
@@ -113,11 +113,11 @@ jobs:
       # ============================================
       # 4. Setup ZyC Clang 15.0.7 toolchain
       # ============================================
-      - name: "\U0001F527 Setup ZyC Clang toolchain"
+      - name: "🔧 Setup ZyC Clang toolchain"
         run: |
           mkdir -p $GITHUB_WORKSPACE/toolchains/clang
           CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20260507-release/Clang-15.0.7-20260507.tar.gz"
-          echo "\U0001F4E5 Downloading ZyC Clang 15.0.7..."
+          echo "📥 Downloading ZyC Clang 15.0.7..."
           wget -q "$CLANG_URL" -O clang.tar.gz
           tar -C $GITHUB_WORKSPACE/toolchains/clang -zxf clang.tar.gz
           rm clang.tar.gz
@@ -127,64 +127,107 @@ jobs:
       # ============================================
       # 5. Integrate SukiSU-Ultra (main branch, no SUSFS)
       # ============================================
-      - name: "\U0001F510 Integrate SukiSU-Ultra"
+      - name: "🔐 Integrate SukiSU-Ultra"
         working-directory: kernel_source
         run: |
-          echo "\U0001F510 Integrating SukiSU-Ultra (branch: ${{ github.event.inputs.SUKISU_BRANCH }})..."
+          echo "🔐 Integrating SukiSU-Ultra (branch: ${{ github.event.inputs.SUKISU_BRANCH }})..."
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
             | bash -s ${{ github.event.inputs.SUKISU_BRANCH }}
           if [ -d "KernelSU" ]; then
-            echo "\u2705 SukiSU-Ultra integrated successfully!"
+            echo "✅ SukiSU-Ultra integrated successfully!"
             SUKISU_VERSION=$(cd KernelSU && git log -1 --format="%h")
             echo "SUKISU_VERSION=$SUKISU_VERSION" >> $GITHUB_ENV
           else
-            echo "\u274C SukiSU-Ultra integration failed!"
+            echo "❌ SukiSU-Ultra integration failed!"
             exit 1
           fi
 
       # ============================================
-      # 5.1. Fix qcacld-3.0 Clang 15+ build errors
+      # 5.1. Fix qcacld-3.0 header (source-level patch)
       # ============================================
-      - name: "\U0001FA79 Fix qcacld-3.0 Clang 15 warnings"
+      - name: "🩹 Fix qcacld-3.0 header mismatch"
         working-directory: kernel_source
         run: |
-          echo "\U0001FA79 Fixing -Warray-parameter mismatch in qcacld-3.0..."
-
-          # --- Fix 1: Patch header to match definition (SIR_MDIE_SIZE) ---
+          echo "🩹 Fixing -Warray-parameter mismatch in qcacld-3.0 header..."
           HEADER="drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h"
           if [ -f "$HEADER" ]; then
             sed -i 's/uint8_t mdie\[\]/uint8_t mdie[SIR_MDIE_SIZE]/' "$HEADER"
-            echo "\u2705 Patched $HEADER: mdie[] -> mdie[SIR_MDIE_SIZE]"
+            echo "✅ Patched $HEADER: mdie[] -> mdie[SIR_MDIE_SIZE]"
+          else
+            echo "⏭️ $HEADER not found, skipping"
           fi
 
-          # --- Fix 2: Disable -Werror for array-parameter in qcacld-3.0 ---
-          KBUILD="drivers/staging/qcacld-3.0/Kbuild"
-          if [ -f "$KBUILD" ]; then
-            if ! grep -q "Wno-error=array-parameter" "$KBUILD"; then
-              sed -i '/^ccflags-y/a ccflags-y += -Wno-error=array-parameter' "$KBUILD"
-              echo "\u2705 Added -Wno-error=array-parameter to $KBUILD"
-            fi
+      # ============================================
+      # 5.2. Fix rmnet_ipa.c enum casts (source-level patch)
+      # ============================================
+      - name: "🩹 Fix rmnet_ipa.c enum type casts"
+        working-directory: kernel_source
+        run: |
+          echo "🩹 Fixing implicit enum conversions in rmnet_ipa.c..."
+          FILE="techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c"
+          if [ -f "$FILE" ]; then
+            # Cast ipa_ip_type_enum_v01 -> ipa_ip_type
+            sed -i 's/q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;/q6_ul_flt_rule_ptr->ip = (enum ipa_ip_type)flt_spec_ptr->ip_type;/' "$FILE"
+
+            # Cast ipa_filter_action_enum_v01 -> ipa_flt_action
+            sed -i 's/q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;/q6_ul_flt_rule_ptr->action = (enum ipa_flt_action)flt_spec_ptr->filter_action;/' "$FILE"
+
+            echo "✅ Patched $FILE with explicit enum casts"
+          else
+            echo "⏭️ $FILE not found, skipping"
           fi
 
-          # --- Fix 3: Also patch qca-wifi-host-cmn if present ---
-          KBUILD_CMN="drivers/staging/qca-wifi-host-cmn/Kbuild"
-          if [ -f "$KBUILD_CMN" ]; then
-            if ! grep -q "Wno-error=array-parameter" "$KBUILD_CMN"; then
-              sed -i '/^ccflags-y/a ccflags-y += -Wno-error=array-parameter' "$KBUILD_CMN"
-              echo "\u2705 Added -Wno-error=array-parameter to $KBUILD_CMN"
-            fi
+      # ============================================
+      # 5.3. Global Clang 15 compatibility flag patches
+      # ============================================
+      - name: "🩹 Global Clang 15 compat patches"
+        working-directory: kernel_source
+        run: |
+          echo "🩹 Applying global Clang 15 warning suppression flags..."
+
+          PATCHED=0
+
+          # --- Fix -Werror=enum-conversion across ALL techpacks ---
+          if [ -d "techpack" ]; then
+            find techpack/ -name "Makefile" -o -name "Kbuild" | while read f; do
+              if ! grep -q "Wno-error=enum-conversion" "$f"; then
+                echo 'ccflags-y += -Wno-error=enum-conversion' >> "$f"
+                echo "  ✅ Patched: $f (enum-conversion)"
+              fi
+            done
           fi
 
-          echo "\u2705 Clang 15 compatibility patches applied!"
+          # --- Fix -Werror=array-parameter across staging drivers ---
+          if [ -d "drivers/staging" ]; then
+            find drivers/staging/ -name "Kbuild" -o -name "Makefile" | while read f; do
+              if ! grep -q "Wno-error=array-parameter" "$f"; then
+                echo 'ccflags-y += -Wno-error=array-parameter' >> "$f"
+                echo "  ✅ Patched: $f (array-parameter)"
+              fi
+            done
+          fi
+
+          # --- Additional: Fix common Clang 15 warnings in techpack ---
+          # -Wunused-but-set-variable (common in older Qualcomm code)
+          # -Wbitfield-constant-conversion
+          if [ -d "techpack" ]; then
+            find techpack/ -name "Makefile" -o -name "Kbuild" | while read f; do
+              if ! grep -q "Wno-error=unused-but-set-variable" "$f"; then
+                echo 'ccflags-y += -Wno-error=unused-but-set-variable' >> "$f"
+              fi
+            done
+          fi
+
+          echo "✅ Global Clang 15 compat patches applied!"
 
       # ============================================
       # 6. Apply manual hook patches (if selected)
       # ============================================
-      - name: "\U0001FA9D Apply manual hook patches"
+      - name: "🪝 Apply manual hook patches"
         if: ${{ github.event.inputs.HOOK_METHOD == 'manual' }}
         working-directory: kernel_source
         run: |
-          echo "\U0001FA9D Applying manual hook patches..."
+          echo "🪝 Applying manual hook patches..."
 
           # --- fs/exec.c ---
           sed -i '/static int do_execveat_common/i \
@@ -270,12 +313,12 @@ jobs:
           #endif
           }' fs/devpts/inode.c
 
-          echo "\u2705 Manual hook patches applied!"
+          echo "✅ Manual hook patches applied!"
 
       # ============================================
       # 7. Configure kernel defconfig
       # ============================================
-      - name: "\u2699\uFE0F Configure kernel"
+      - name: "⚙️ Configure kernel"
         working-directory: kernel_source
         run: |
           make -j$(nproc) O=out ARCH=arm64 \
@@ -327,10 +370,10 @@ jobs:
       # ============================================
       # 8. Build kernel
       # ============================================
-      - name: "\U0001F528 Build kernel"
+      - name: "🔨 Build kernel"
         working-directory: kernel_source
         run: |
-          echo "\U0001F528 Starting kernel build..."
+          echo "🔨 Starting kernel build..."
           START_TIME=$(date +%s)
 
           make -j$(nproc) O=out ARCH=arm64 \
@@ -348,19 +391,19 @@ jobs:
 
           END_TIME=$(date +%s)
           ELAPSED=$((END_TIME - START_TIME))
-          echo "\u23F1\uFE0F Build time: $((ELAPSED / 60))m $((ELAPSED % 60))s"
+          echo "⏱️ Build time: $((ELAPSED / 60))m $((ELAPSED % 60))s"
 
           if [ -f "out/arch/arm64/boot/Image" ]; then
-            echo "\u2705 Kernel Image built successfully!"
+            echo "✅ Kernel Image built successfully!"
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image" >> $GITHUB_ENV
           elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            echo "\u2705 Kernel Image.gz built successfully!"
+            echo "✅ Kernel Image.gz built successfully!"
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz" >> $GITHUB_ENV
           elif [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
-            echo "\u2705 Kernel Image.gz-dtb built successfully!"
+            echo "✅ Kernel Image.gz-dtb built successfully!"
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz-dtb" >> $GITHUB_ENV
           else
-            echo "\u274C Kernel build failed!"
+            echo "❌ Kernel build failed!"
             tail -100 build.log
             exit 1
           fi
@@ -368,7 +411,7 @@ jobs:
       # ============================================
       # 9. Package with AnyKernel3
       # ============================================
-      - name: "\U0001F4E6 Package with AnyKernel3"
+      - name: "📦 Package with AnyKernel3"
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cd AnyKernel3
@@ -427,27 +470,27 @@ jobs:
           ZIPNAME="SukiSU-Ultra-lisa-${{ env.KERNEL_VERSION }}-$(date +%Y%m%d).zip"
           zip -r9 "../$ZIPNAME" * -x '*.git*'
           echo "ZIP_NAME=$ZIPNAME" >> $GITHUB_ENV
-          echo "\u2705 AnyKernel3 zip created: $ZIPNAME"
+          echo "✅ AnyKernel3 zip created: $ZIPNAME"
           ls -lh "../$ZIPNAME"
 
       # ============================================
       # 10. Upload artifacts
       # ============================================
-      - name: "\U0001F4E4 Upload AnyKernel3 zip"
+      - name: "📤 Upload AnyKernel3 zip"
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ZIP_NAME }}
           path: ${{ env.ZIP_NAME }}
           retention-days: 7
 
-      - name: "\U0001F4E4 Upload kernel image"
+      - name: "📤 Upload kernel image"
         uses: actions/upload-artifact@v4
         with:
           name: kernel-image-lisa
           path: kernel_source/${{ env.KERNEL_IMAGE }}
           retention-days: 7
 
-      - name: "\U0001F4E4 Upload build log"
+      - name: "📤 Upload build log"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -458,14 +501,14 @@ jobs:
       # ============================================
       # 11. Create GitHub Release
       # ============================================
-      - name: "\U0001F680 Create GitHub Release"
+      - name: "🚀 Create GitHub Release"
         if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.KERNEL_VERSION }}-sukisu-${{ env.SUKISU_VERSION }}-${{ github.run_number }}
           name: "Lisa Kernel ${{ env.KERNEL_VERSION }} + SukiSU-Ultra"
           body: |
-            ## \U0001F4F1 Kernel for Xiaomi 11 Lite NE 5G (lisa)
+            ## 📱 Kernel for Xiaomi 11 Lite NE 5G (lisa)
 
             | Property | Value |
             |---|---|
@@ -476,7 +519,7 @@ jobs:
             | **KPM** | ${{ github.event.inputs.ENABLE_KPM }} |
             | **Clang** | ZyC 15.0.7 |
 
-            ### \u26A1 Flash Instructions
+            ### ⚡ Flash Instructions
             1. Boot into TWRP / custom recovery
             2. Flash the AnyKernel3 zip
             3. Reboot & install SukiSU-Ultra Manager
