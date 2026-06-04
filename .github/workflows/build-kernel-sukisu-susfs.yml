@@ -56,11 +56,10 @@ jobs:
       # ============================================
       # 1. Aggressive disk cleanup
       # ============================================
-      - name: 🧹 Free disk space
+      - name: "🧹 Free disk space"
         run: |
           echo "🧹 Before cleanup:"
           df -h /
-
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
@@ -82,18 +81,16 @@ jobs:
           sudo rm -rf /usr/share/sbt
           sudo rm -rf /usr/local/julia*
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-
           sudo docker image prune --all --force 2>/dev/null || true
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
-
           echo "✅ After cleanup:"
           df -h /
 
       # ============================================
       # 2. Install dependencies (Ubuntu 24.04 compatible)
       # ============================================
-      - name: 📦 Install build dependencies
+      - name: "📦 Install build dependencies"
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -108,7 +105,7 @@ jobs:
       # ============================================
       # 3. Clone kernel source
       # ============================================
-      - name: 📥 Clone kernel source
+      - name: "📥 Clone kernel source"
         run: |
           git clone --depth=1 \
             -b ${{ github.event.inputs.KERNEL_BRANCH }} \
@@ -121,29 +118,26 @@ jobs:
       # ============================================
       # 4. Setup ZyC Clang 15.0.7 toolchain
       # ============================================
-      - name: 🔧 Setup ZyC Clang toolchain
+      - name: "🔧 Setup ZyC Clang toolchain"
         run: |
           mkdir -p $GITHUB_WORKSPACE/toolchains/clang
-
           CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20260507-release/Clang-15.0.7-20260507.tar.gz"
           echo "📥 Downloading ZyC Clang 15.0.7..."
           wget -q "$CLANG_URL" -O clang.tar.gz
           tar -C $GITHUB_WORKSPACE/toolchains/clang -zxf clang.tar.gz
           rm clang.tar.gz
-
           echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
           $GITHUB_WORKSPACE/toolchains/clang/bin/clang --version
 
       # ============================================
       # 5. Integrate SukiSU-Ultra
       # ============================================
-      - name: 🔐 Integrate SukiSU-Ultra
+      - name: "🔐 Integrate SukiSU-Ultra"
         working-directory: kernel_source
         run: |
           echo "🔐 Integrating SukiSU-Ultra (branch: ${{ github.event.inputs.SUKISU_BRANCH }})..."
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
             | bash -s ${{ github.event.inputs.SUKISU_BRANCH }}
-
           if [ -d "KernelSU" ]; then
             echo "✅ SukiSU-Ultra integrated successfully!"
             SUKISU_VERSION=$(cd KernelSU && git log -1 --format="%h")
@@ -154,42 +148,50 @@ jobs:
           fi
 
       # ============================================
-      # 6. Integrate SUSFS patches
+      # 6. Integrate SUSFS patches (FIX: copy ALL files)
       # ============================================
-      - name: 🛡️ Integrate SUSFS patches
+      - name: "🛡️ Integrate SUSFS patches"
         if: ${{ github.event.inputs.ENABLE_SUSFS == 'true' }}
         working-directory: kernel_source
         run: |
-                echo "🛡️ Cloning susfs4ksu (kernel-5.4 branch)..."
-                git clone --depth=1 -b kernel-5.4 \
-                  https://gitlab.com/simonpunk/susfs4ksu.git $GITHUB_WORKSPACE/susfs4ksu
-      
-                SUSFS_DIR="$GITHUB_WORKSPACE/susfs4ksu"
-      
-                echo "📂 Copying SUSFS source files..."
-                # ✅ FIX: Use wildcards to copy ALL files (susfs.c, susfs.h, susfs_def.h, etc.)
-                cp $SUSFS_DIR/kernel_patches/fs/* fs/
-                cp $SUSFS_DIR/kernel_patches/include/linux/* include/linux/
-      
-                echo "📂 Verify copied headers:"
-                ls -la include/linux/susfs*
-      
-                echo "🩹 Patching KernelSU for SUSFS support..."
-                cp $SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
-                cd KernelSU
-                patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
-                cd ..
-      
-                echo "🩹 Patching kernel source for SUSFS..."
-                cp $SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-5.4.patch .
-                patch -p1 --forward < 50_add_susfs_in_kernel-5.4.patch || true
-      
-                echo "✅ SUSFS patches applied!"
+          echo "🛡️ Cloning susfs4ksu (kernel-5.4 branch)..."
+          git clone --depth=1 -b kernel-5.4 \
+            https://gitlab.com/simonpunk/susfs4ksu.git $GITHUB_WORKSPACE/susfs4ksu
+
+          SUSFS_DIR="$GITHUB_WORKSPACE/susfs4ksu"
+
+          echo "📂 Listing available SUSFS source files..."
+          echo "--- fs/ ---"
+          ls -la $SUSFS_DIR/kernel_patches/fs/
+          echo "--- include/linux/ ---"
+          ls -la $SUSFS_DIR/kernel_patches/include/linux/
+
+          echo "📂 Copying ALL SUSFS source files (susfs.c, susfs.h, susfs_def.h, etc.)..."
+          cp $SUSFS_DIR/kernel_patches/fs/* fs/
+          cp $SUSFS_DIR/kernel_patches/include/linux/* include/linux/
+
+          echo "📂 Verify copied files:"
+          echo "--- fs/susfs* ---"
+          ls -la fs/susfs*
+          echo "--- include/linux/susfs* ---"
+          ls -la include/linux/susfs*
+
+          echo "🩹 Patching KernelSU for SUSFS support..."
+          cp $SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+          cd KernelSU
+          patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
+          cd ..
+
+          echo "🩹 Patching kernel source for SUSFS..."
+          cp $SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-5.4.patch .
+          patch -p1 --forward < 50_add_susfs_in_kernel-5.4.patch || true
+
+          echo "✅ SUSFS patches applied!"
 
       # ============================================
       # 7. Apply manual hook patches (if selected)
       # ============================================
-      - name: 🪝 Apply manual hook patches
+      - name: "🪝 Apply manual hook patches"
         if: ${{ github.event.inputs.HOOK_METHOD == 'manual' }}
         working-directory: kernel_source
         run: |
@@ -284,7 +286,7 @@ jobs:
       # ============================================
       # 8. Configure kernel defconfig
       # ============================================
-      - name: ⚙️ Configure kernel
+      - name: "⚙️ Configure kernel"
         working-directory: kernel_source
         run: |
           make -j$(nproc) O=out ARCH=arm64 \
@@ -342,7 +344,7 @@ jobs:
       # ============================================
       # 9. Build kernel
       # ============================================
-      - name: 🔨 Build kernel
+      - name: "🔨 Build kernel"
         working-directory: kernel_source
         run: |
           echo "🔨 Starting kernel build..."
@@ -383,11 +385,10 @@ jobs:
       # ============================================
       # 10. Package with AnyKernel3
       # ============================================
-      - name: 📦 Package with AnyKernel3
+      - name: "📦 Package with AnyKernel3"
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cd AnyKernel3
-
           rm -rf ramdisk patch README.md .git .github
 
           cat > anykernel.sh << 'EOF'
@@ -418,7 +419,6 @@ jobs:
           . tools/ak3-core.sh;
 
           set_perm_recursive 0 0 755 644 $ramdisk/*;
-
           dump_boot;
           write_boot;
           EOF
@@ -450,21 +450,21 @@ jobs:
       # ============================================
       # 11. Upload artifacts
       # ============================================
-      - name: 📤 Upload AnyKernel3 zip
+      - name: "📤 Upload AnyKernel3 zip"
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ZIP_NAME }}
           path: ${{ env.ZIP_NAME }}
           retention-days: 7
 
-      - name: 📤 Upload kernel image
+      - name: "📤 Upload kernel image"
         uses: actions/upload-artifact@v4
         with:
           name: kernel-image-lisa
           path: kernel_source/${{ env.KERNEL_IMAGE }}
           retention-days: 7
 
-      - name: 📤 Upload build log
+      - name: "📤 Upload build log"
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -475,7 +475,7 @@ jobs:
       # ============================================
       # 12. Create GitHub Release
       # ============================================
-      - name: 🚀 Create GitHub Release
+      - name: "🚀 Create GitHub Release"
         if: success()
         uses: softprops/action-gh-release@v2
         with:
@@ -486,18 +486,4 @@ jobs:
 
             | Property | Value |
             |---|---|
-            | **Kernel** | ${{ env.KERNEL_VERSION }} |
-            | **SukiSU-Ultra** | ${{ env.SUKISU_VERSION }} (${{ github.event.inputs.SUKISU_BRANCH }}) |
-            | **Defconfig** | ${{ github.event.inputs.KERNEL_DEFCONFIG }} |
-            | **Hook Method** | ${{ github.event.inputs.HOOK_METHOD }} |
-            | **SUSFS** | ${{ github.event.inputs.ENABLE_SUSFS }} |
-            | **KPM** | ${{ github.event.inputs.ENABLE_KPM }} |
-            | **Clang** | ZyC 15.0.7 |
-
-            ### ⚡ Flash Instructions
-            1. Boot into TWRP / custom recovery
-            2. Flash the AnyKernel3 zip
-            3. Reboot & install SukiSU-Ultra Manager
-          files: ${{ env.ZIP_NAME }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            | **
