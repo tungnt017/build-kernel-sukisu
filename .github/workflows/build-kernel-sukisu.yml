@@ -16,9 +16,9 @@ on:
         required: true
         default: "lisa_defconfig"
       SUKISU_BRANCH:
-        description: "SukiSU-Ultra branch (builtin / susfs-main / main)"
+        description: "SukiSU-Ultra branch"
         required: true
-        default: "builtin"
+        default: "main"
       HOOK_METHOD:
         description: "Hook method"
         required: true
@@ -49,17 +49,41 @@ jobs:
 
     steps:
       # ============================================
-      # 1. Maximize disk space
+      # 1. Aggressive disk cleanup
       # ============================================
-      - name: 🧹 Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 8192
-          swap-size-mb: 8192
-          remove-dotnet: "true"
-          remove-android: "true"
-          remove-haskell: "true"
-          remove-codeql: "true"
+      - name: 🧹 Free disk space
+        run: |
+          echo "🧹 Before cleanup:"
+          df -h /
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/graalvm
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /opt/microsoft/msedge
+          sudo rm -rf /opt/microsoft/powershell
+          sudo rm -rf /opt/pipx
+          sudo rm -rf /usr/lib/mono
+          sudo rm -rf /usr/lib/heroku
+          sudo rm -rf /usr/lib/google-cloud-sdk
+          sudo rm -rf /usr/share/miniconda
+          sudo rm -rf /usr/share/az_*
+          sudo rm -rf /usr/share/gradle-*
+          sudo rm -rf /usr/share/sbt
+          sudo rm -rf /usr/local/julia*
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "✅ After cleanup:"
+          df -h /
 
       # ============================================
       # 2. Install dependencies (Ubuntu 24.04 compatible)
@@ -96,21 +120,17 @@ jobs:
         run: |
           mkdir -p $GITHUB_WORKSPACE/toolchains/clang
 
-          # ZyC Clang 15.0.7 (stable for kernel 5.4)
           CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20260507-release/Clang-15.0.7-20260507.tar.gz"
           echo "📥 Downloading ZyC Clang 15.0.7..."
           wget -q "$CLANG_URL" -O clang.tar.gz
           tar -C $GITHUB_WORKSPACE/toolchains/clang -zxf clang.tar.gz
           rm clang.tar.gz
 
-          # ZyC Clang bundles cross-compilers, no separate GCC needed
           echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
-
-          # Verify
           $GITHUB_WORKSPACE/toolchains/clang/bin/clang --version
 
       # ============================================
-      # 5. Integrate SukiSU-Ultra
+      # 5. Integrate SukiSU-Ultra (main branch, no SUSFS)
       # ============================================
       - name: 🔐 Integrate SukiSU-Ultra
         working-directory: kernel_source
@@ -301,7 +321,6 @@ jobs:
           ELAPSED=$((END_TIME - START_TIME))
           echo "⏱️ Build time: $((ELAPSED / 60))m $((ELAPSED % 60))s"
 
-          # Check kernel image output
           if [ -f "out/arch/arm64/boot/Image" ]; then
             echo "✅ Kernel Image built successfully!"
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image" >> $GITHUB_ENV
@@ -312,7 +331,7 @@ jobs:
             echo "✅ Kernel Image.gz-dtb built successfully!"
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz-dtb" >> $GITHUB_ENV
           else
-            echo "❌ Kernel build failed! No Image found."
+            echo "❌ Kernel build failed!"
             tail -100 build.log
             exit 1
           fi
@@ -325,16 +344,13 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           cd AnyKernel3
 
-          # Remove example/unneeded files
           rm -rf ramdisk patch README.md .git .github
 
-          # Write custom anykernel.sh for Xiaomi Lisa (A/B slot device)
           cat > anykernel.sh << 'EOF'
           # AnyKernel3 Ramdisk Mod Script
           # osm0sis @ xda-developers
 
           ## AnyKernel setup
-          # begin properties
           properties() { '
           kernel.string=SukiSU-Ultra Kernel for Xiaomi 11 Lite NE 5G (lisa)
           do.devicecheck=1
@@ -350,7 +366,6 @@ jobs:
           supported.vendorpatchlevels=
           '; }
 
-          # shell variables
           BLOCK=/dev/block/bootdevice/by-name/boot;
           IS_SLOT_DEVICE=1;
           RAMDISK_COMPRESSION=auto;
@@ -358,17 +373,12 @@ jobs:
 
           . tools/ak3-core.sh;
 
-          ## AnyKernel file attributes
           set_perm_recursive 0 0 755 644 $ramdisk/*;
 
-          ## AnyKernel install
           dump_boot;
-
           write_boot;
-          ## end install
           EOF
 
-          # Copy kernel image
           if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image" ]; then
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image .
           elif [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz" ]; then
@@ -377,23 +387,19 @@ jobs:
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb .
           fi
 
-          # Copy DTB files if available
           mkdir -p dtbs
           if [ -d "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom" ]; then
             find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom \
               -name "*.dtb" -exec cp {} dtbs/ \; 2>/dev/null || true
           fi
 
-          # Copy DTBO if available
           if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img" ]; then
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img .
           fi
 
-          # Create flashable zip
           ZIPNAME="SukiSU-Ultra-lisa-${{ env.KERNEL_VERSION }}-$(date +%Y%m%d).zip"
           zip -r9 "../$ZIPNAME" * -x '*.git*'
           echo "ZIP_NAME=$ZIPNAME" >> $GITHUB_ENV
-
           echo "✅ AnyKernel3 zip created: $ZIPNAME"
           ls -lh "../$ZIPNAME"
 
