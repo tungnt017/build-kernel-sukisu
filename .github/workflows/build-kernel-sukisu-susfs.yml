@@ -1,4 +1,4 @@
-name: Build Kernel with SukiSU-Ultra
+name: Build Kernel with SukiSU-Ultra-Susfs
 
 on:
   workflow_dispatch:
@@ -54,17 +54,41 @@ jobs:
 
     steps:
       # ============================================
-      # 1. Maximize disk space
+      # 1. Aggressive disk cleanup
       # ============================================
-      - name: 🧹 Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 8192
-          swap-size-mb: 8192
-          remove-dotnet: "true"
-          remove-android: "true"
-          remove-haskell: "true"
-          remove-codeql: "true"
+      - name: 🧹 Free disk space
+        run: |
+          echo "🧹 Before cleanup:"
+          df -h /
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/graalvm
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /opt/microsoft/msedge
+          sudo rm -rf /opt/microsoft/powershell
+          sudo rm -rf /opt/pipx
+          sudo rm -rf /usr/lib/mono
+          sudo rm -rf /usr/lib/heroku
+          sudo rm -rf /usr/lib/google-cloud-sdk
+          sudo rm -rf /usr/share/miniconda
+          sudo rm -rf /usr/share/az_*
+          sudo rm -rf /usr/share/gradle-*
+          sudo rm -rf /usr/share/sbt
+          sudo rm -rf /usr/local/julia*
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          sudo docker image prune --all --force 2>/dev/null || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "✅ After cleanup:"
+          df -h /
 
       # ============================================
       # 2. Install dependencies (Ubuntu 24.04 compatible)
@@ -142,19 +166,16 @@ jobs:
 
           SUSFS_DIR="$GITHUB_WORKSPACE/susfs4ksu"
 
-          # Copy SUSFS source files into kernel tree
           echo "📂 Copying SUSFS source files..."
           cp $SUSFS_DIR/kernel_patches/fs/susfs.c fs/
           cp $SUSFS_DIR/kernel_patches/include/linux/susfs.h include/linux/
 
-          # Copy and apply KernelSU SUSFS patch
           echo "🩹 Patching KernelSU for SUSFS support..."
           cp $SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
           cd KernelSU
           patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
           cd ..
 
-          # Apply kernel SUSFS patch
           echo "🩹 Patching kernel source for SUSFS..."
           cp $SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-5.4.patch .
           patch -p1 --forward < 50_add_susfs_in_kernel-5.4.patch || true
@@ -398,7 +419,6 @@ jobs:
           write_boot;
           EOF
 
-          # Copy kernel image
           if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image" ]; then
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image .
           elif [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz" ]; then
@@ -407,14 +427,12 @@ jobs:
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb .
           fi
 
-          # Copy DTBs if available
           mkdir -p dtbs
           if [ -d "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom" ]; then
             find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom \
               -name "*.dtb" -exec cp {} dtbs/ \; 2>/dev/null || true
           fi
 
-          # Copy DTBO if available
           if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img" ]; then
             cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img .
           fi
