@@ -20,24 +20,20 @@ on:
         required: true
         default: "builtin"
       HOOK_METHOD:
-        description: "Hook method (kprobe / manual)"
+        description: "Hook method"
         required: true
         default: "manual"
         type: choice
         options:
           - kprobe
           - manual
-      CLANG_VERSION:
-        description: "AOSP Clang version"
-        required: true
-        default: "r416183b"
       ENABLE_KPM:
         description: "Enable KPM (Kernel Patch Module)"
         required: false
         default: "true"
         type: boolean
       DISABLE_LTO:
-        description: "Disable LTO (Link Time Optimization)"
+        description: "Disable LTO"
         required: false
         default: "false"
         type: boolean
@@ -70,11 +66,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git-core gnupg flex bison build-essential zip curl \
-            zlib1g-dev libc6-dev-i386 \
+            zlib1g-dev libc6-dev-i386 libncurses5 lib32ncurses5-dev \
             x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
             libxml2-utils xsltproc unzip fontconfig python3 \
             bc cpio kmod libelf-dev libssl-dev \
-            lld llvm binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+            lld llvm
 
       # ============================================
       # 3. Clone kernel source
@@ -90,37 +86,23 @@ jobs:
           echo "KERNEL_ROOT=$(pwd)" >> $GITHUB_ENV
 
       # ============================================
-      # 4. Setup AOSP Clang toolchain
+      # 4. Setup ZyC Clang toolchain
       # ============================================
-      - name: 🔧 Setup Clang toolchain
+      - name: 🔧 Setup ZyC Clang toolchain
         run: |
           mkdir -p $GITHUB_WORKSPACE/toolchains/clang
-          mkdir -p $GITHUB_WORKSPACE/toolchains/gcc-arm64
-          mkdir -p $GITHUB_WORKSPACE/toolchains/gcc-arm32
 
-          # Download AOSP Clang
-          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2022/clang-${{ github.event.inputs.CLANG_VERSION }}.tar.gz"
-          echo "📥 Downloading Clang from: $CLANG_URL"
+          # Download ZyC Clang 15.0.7 (stable for kernel 5.4)
+          CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20260507-release/Clang-15.0.7-20260507.tar.gz"
+          echo "📥 Downloading ZyC Clang 15.0.7..."
           wget -q "$CLANG_URL" -O clang.tar.gz
           tar -C $GITHUB_WORKSPACE/toolchains/clang -zxf clang.tar.gz
           rm clang.tar.gz
 
-          # Download GCC arm64
-          GCC64_URL="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz"
-          wget -q "$GCC64_URL" -O gcc64.tar.gz
-          tar -C $GITHUB_WORKSPACE/toolchains/gcc-arm64 -zxf gcc64.tar.gz
-          rm gcc64.tar.gz
-
-          # Download GCC arm32 (for compat vDSO)
-          GCC32_URL="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz"
-          wget -q "$GCC32_URL" -O gcc32.tar.gz
-          tar -C $GITHUB_WORKSPACE/toolchains/gcc-arm32 -zxf gcc32.tar.gz
-          rm gcc32.tar.gz
-
-          # Export paths
           echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
-          echo "$GITHUB_WORKSPACE/toolchains/gcc-arm64/bin" >> $GITHUB_PATH
-          echo "$GITHUB_WORKSPACE/toolchains/gcc-arm32/bin" >> $GITHUB_PATH
+
+          # Verify installation
+          clang --version
 
       # ============================================
       # 5. Integrate SukiSU-Ultra
@@ -132,7 +114,6 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
             | bash -s ${{ github.event.inputs.SUKISU_BRANCH }}
 
-          # Verify integration
           if [ -d "KernelSU" ]; then
             echo "✅ SukiSU-Ultra integrated successfully!"
             SUKISU_VERSION=$(cd KernelSU && git log -1 --format="%h")
@@ -245,8 +226,8 @@ jobs:
         run: |
           make -j$(nproc) O=out ARCH=arm64 \
             CC=clang \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             ${{ github.event.inputs.KERNEL_DEFCONFIG }}
 
@@ -255,7 +236,6 @@ jobs:
           echo "# SukiSU-Ultra configs" >> out/.config
           echo "CONFIG_KSU=y" >> out/.config
 
-          # Hook method config
           if [ "${{ github.event.inputs.HOOK_METHOD }}" = "manual" ]; then
             echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
             echo "# CONFIG_KPROBES is not set" >> out/.config
@@ -265,14 +245,12 @@ jobs:
             echo "CONFIG_KPROBE_EVENTS=y" >> out/.config
           fi
 
-          # KPM support
           if [ "${{ github.event.inputs.ENABLE_KPM }}" = "true" ]; then
             echo "CONFIG_KPM=y" >> out/.config
             echo "CONFIG_KALLSYMS=y" >> out/.config
             echo "CONFIG_KALLSYMS_ALL=y" >> out/.config
           fi
 
-          # Disable LTO if requested
           if [ "${{ github.event.inputs.DISABLE_LTO }}" = "true" ]; then
             sed -i 's/CONFIG_LTO=y/# CONFIG_LTO is not set/g' out/.config
             sed -i 's/CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/g' out/.config
@@ -280,136 +258,9 @@ jobs:
             echo "CONFIG_LTO_NONE=y" >> out/.config
           fi
 
-          # Refresh config
           make -j$(nproc) O=out ARCH=arm64 \
             CC=clang \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            olddefconfig
-
-      # ============================================
-      # 8. Build kernel
-      # ============================================
-      - name: 🔨 Build kernel
-        working-directory: kernel_source
-        run: |
-          echo "🔨 Starting kernel build..."
-          START_TIME=$(date +%s)
-
-          make -j$(nproc) O=out ARCH=arm64 \
-            CC=clang \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip \
-            2>&1 | tee build.log
-
-          END_TIME=$(date +%s)
-          ELAPSED=$((END_TIME - START_TIME))
-          echo "⏱️ Build time: $((ELAPSED / 60))m $((ELAPSED % 60))s"
-
-          # Check if kernel image exists
-          if [ -f "out/arch/arm64/boot/Image" ]; then
-            echo "✅ Kernel Image built successfully!"
-            echo "KERNEL_IMAGE=out/arch/arm64/boot/Image" >> $GITHUB_ENV
-          elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            echo "✅ Kernel Image.gz built successfully!"
-            echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz" >> $GITHUB_ENV
-          elif [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
-            echo "✅ Kernel Image.gz-dtb built successfully!"
-            echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz-dtb" >> $GITHUB_ENV
-          else
-            echo "❌ Kernel build failed! No Image found."
-            tail -100 build.log
-            exit 1
-          fi
-
-      # ============================================
-      # 9. Package with AnyKernel3
-      # ============================================
-      - name: 📦 Package with AnyKernel3
-        run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-
-          # Configure AnyKernel3 for lisa
-          cd AnyKernel3
-          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
-          sed -i 's|device.name1=.*|device.name1=lisa|g' anykernel.sh
-          sed -i 's|device.name2=.*|device.name2=|g' anykernel.sh
-          sed -i 's|supported.versions=.*|supported.versions=12-14|g' anykernel.sh
-
-          # Copy kernel image
-          cp $GITHUB_WORKSPACE/kernel_source/${{ env.KERNEL_IMAGE }} .
-
-          # Copy DTBs if available
-          if [ -d "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom" ]; then
-            find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom -name "*.dtb" -exec cp {} dtbs/ \; 2>/dev/null || true
-          fi
-
-          # Remove unnecessary files
-          rm -rf .git .github README.md
-
-          # Create flashable zip
-          ZIPNAME="SukiSU-Ultra-lisa-${{ env.KERNEL_VERSION }}-$(date +%Y%m%d).zip"
-          zip -r9 "../$ZIPNAME" * -x '*.git*'
-          echo "ZIP_NAME=$ZIPNAME" >> $GITHUB_ENV
-
-      # ============================================
-      # 10. Upload artifacts
-      # ============================================
-      - name: 📤 Upload AnyKernel3 zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ZIP_NAME }}
-          path: ${{ env.ZIP_NAME }}
-          retention-days: 7
-
-      - name: 📤 Upload kernel image
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-image-lisa
-          path: kernel_source/${{ env.KERNEL_IMAGE }}
-          retention-days: 7
-
-      - name: 📤 Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: kernel_source/build.log
-          retention-days: 3
-
-      # ============================================
-      # 11. Create release (optional)
-      # ============================================
-      - name: 🚀 Create GitHub Release
-        if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.KERNEL_VERSION }}-sukisu-${{ env.SUKISU_VERSION }}-${{ github.run_number }}
-          name: "Lisa Kernel ${{ env.KERNEL_VERSION }} + SukiSU-Ultra"
-          body: |
-            ## 📱 Kernel for Xiaomi 11 Lite NE 5G (lisa)
-
-            | Property | Value |
-            |---|---|
-            | **Kernel** | ${{ env.KERNEL_VERSION }} |
-            | **SukiSU-Ultra** | ${{ env.SUKISU_VERSION }} (${{ github.event.inputs.SUKISU_BRANCH }}) |
-            | **Defconfig** | ${{ github.event.inputs.KERNEL_DEFCONFIG }} |
-            | **Hook Method** | ${{ github.event.inputs.HOOK_METHOD }} |
-            | **KPM** | ${{ github.event.inputs.ENABLE_KPM }} |
-            | **Clang** | AOSP ${{ github.event.inputs.CLANG_VERSION }} |
-
-            ### ⚡ Flash Instructions
-            1. Boot into TWRP/custom recovery
-            2. Flash the AnyKernel3 zip
-            3. Reboot & install SukiSU-Ultra Manager
-          files: ${{ env.ZIP_NAME }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            old
