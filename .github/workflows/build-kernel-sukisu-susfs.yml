@@ -156,35 +156,35 @@ jobs:
       # ============================================
       # 6. Integrate SUSFS patches
       # ============================================
-  - name: 🛡️ Integrate SUSFS patches
-          if: ${{ github.event.inputs.ENABLE_SUSFS == 'true' }}
-          working-directory: kernel_source
-          run: |
-            echo "🛡️ Cloning susfs4ksu (kernel-5.4 branch)..."
-            git clone --depth=1 -b kernel-5.4 \
-              https://gitlab.com/simonpunk/susfs4ksu.git $GITHUB_WORKSPACE/susfs4ksu
-  
-            SUSFS_DIR="$GITHUB_WORKSPACE/susfs4ksu"
-  
-            echo "📂 Copying SUSFS source files..."
-            # ✅ FIX: Use wildcards to copy ALL files (susfs.c, susfs.h, susfs_def.h, etc.)
-            cp $SUSFS_DIR/kernel_patches/fs/* fs/
-            cp $SUSFS_DIR/kernel_patches/include/linux/* include/linux/
-  
-            echo "📂 Verify copied headers:"
-            ls -la include/linux/susfs*
-  
-            echo "🩹 Patching KernelSU for SUSFS support..."
-            cp $SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
-            cd KernelSU
-            patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
-            cd ..
-  
-            echo "🩹 Patching kernel source for SUSFS..."
-            cp $SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-5.4.patch .
-            patch -p1 --forward < 50_add_susfs_in_kernel-5.4.patch || true
-  
-            echo "✅ SUSFS patches applied!"
+      - name: 🛡️ Integrate SUSFS patches
+        if: ${{ github.event.inputs.ENABLE_SUSFS == 'true' }}
+        working-directory: kernel_source
+        run: |
+                echo "🛡️ Cloning susfs4ksu (kernel-5.4 branch)..."
+                git clone --depth=1 -b kernel-5.4 \
+                  https://gitlab.com/simonpunk/susfs4ksu.git $GITHUB_WORKSPACE/susfs4ksu
+      
+                SUSFS_DIR="$GITHUB_WORKSPACE/susfs4ksu"
+      
+                echo "📂 Copying SUSFS source files..."
+                # ✅ FIX: Use wildcards to copy ALL files (susfs.c, susfs.h, susfs_def.h, etc.)
+                cp $SUSFS_DIR/kernel_patches/fs/* fs/
+                cp $SUSFS_DIR/kernel_patches/include/linux/* include/linux/
+      
+                echo "📂 Verify copied headers:"
+                ls -la include/linux/susfs*
+      
+                echo "🩹 Patching KernelSU for SUSFS support..."
+                cp $SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+                cd KernelSU
+                patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
+                cd ..
+      
+                echo "🩹 Patching kernel source for SUSFS..."
+                cp $SUSFS_DIR/kernel_patches/50_add_susfs_in_kernel-5.4.patch .
+                patch -p1 --forward < 50_add_susfs_in_kernel-5.4.patch || true
+      
+                echo "✅ SUSFS patches applied!"
 
       # ============================================
       # 7. Apply manual hook patches (if selected)
