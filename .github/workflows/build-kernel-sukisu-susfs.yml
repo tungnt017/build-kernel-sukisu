@@ -156,7 +156,7 @@ jobs:
       # ============================================
       # 6. Integrate SUSFS patches
       # ============================================
-      - name: 🛡️ Integrate SUSFS patches
+- name: 🛡️ Integrate SUSFS patches
         if: ${{ github.event.inputs.ENABLE_SUSFS == 'true' }}
         working-directory: kernel_source
         run: |
@@ -167,8 +167,12 @@ jobs:
           SUSFS_DIR="$GITHUB_WORKSPACE/susfs4ksu"
 
           echo "📂 Copying SUSFS source files..."
-          cp $SUSFS_DIR/kernel_patches/fs/susfs.c fs/
-          cp $SUSFS_DIR/kernel_patches/include/linux/susfs.h include/linux/
+          # ✅ FIX: Use wildcards to copy ALL files (susfs.c, susfs.h, susfs_def.h, etc.)
+          cp $SUSFS_DIR/kernel_patches/fs/* fs/
+          cp $SUSFS_DIR/kernel_patches/include/linux/* include/linux/
+
+          echo "📂 Verify copied headers:"
+          ls -la include/linux/susfs*
 
           echo "🩹 Patching KernelSU for SUSFS support..."
           cp $SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
