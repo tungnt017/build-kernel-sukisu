@@ -240,6 +240,7 @@ jobs:
           echo "" >> out/.config
           echo "# SukiSU-Ultra configs" >> out/.config
           echo "CONFIG_KSU=y" >> out/.config
+          echo "# CONFIG_KSU_SUSFS is not set" >> out/.config
 
           # Hook method config
           if [ "${{ github.event.inputs.HOOK_METHOD }}" = "manual" ]; then
