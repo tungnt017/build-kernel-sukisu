@@ -319,17 +319,15 @@ jobs:
       # ──────────────────────────────────────────────
       # 11. Download magiskboot (Linux x86_64)
       # ──────────────────────────────────────────────
-      - name: "🧰 Download magiskboot"
+# Extract magiskboot from official Magisk APK
+      - name: Download magiskboot
         run: |
-          # Try multiple sources for magiskboot Linux binary
-          MAGISKBOOT_URL="https://github.com/nicholaschum/magiskboot_build/releases/latest/download/magiskboot-x86_64"
-          wget -q "$MAGISKBOOT_URL" -O magiskboot || {
-            echo "[*] Trying alternative magiskboot source..."
-            MAGISKBOOT_URL2="https://github.com/nicholaschum/magiskboot_build/releases/download/v30.0/magiskboot-x86_64"
-            wget -q "$MAGISKBOOT_URL2" -O magiskboot
-          }
+          MAGISK_VER="v30.7"
+          wget -q "https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_VER}/Magisk-${MAGISK_VER}.apk" -O magisk.apk
+          unzip -jo magisk.apk "lib/x86_64/libmagiskboot.so" -d .
+          mv libmagiskboot.so magiskboot
           chmod +x magiskboot
-          echo "[✓] magiskboot ready"
+          echo "[✓] magiskboot ${MAGISK_VER} ready"
           ./magiskboot || true
 
       # ──────────────────────────────────────────────
