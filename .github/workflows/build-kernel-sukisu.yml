@@ -1,4 +1,4 @@
-name: Build Kernel with SukiSU-Ultra
+name: Build Kernel with SukiSU-Ultra & Repack boot.img
 
 on:
   workflow_dispatch:
@@ -30,659 +30,325 @@ on:
       ENABLE_KPM:
         description: "Enable KPM (Kernel Patch Module)"
         required: false
-        default: "true"
+        default: true
         type: boolean
       DISABLE_LTO:
         description: "Disable LTO"
         required: false
-        default: "false"
+        default: false
         type: boolean
+      STOCK_BOOT_URL:
+        description: "Stock boot.img URL for repacking"
+        required: true
+        default: "https://github.com/tungnt017/build-kernel-sukisu/releases/download/2.0/boot.img"
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build Kernel
+    name: Build Kernel & Repack boot.img
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
     steps:
-      # ============================================
-      # 1. Aggressive disk cleanup
-      # ============================================
-      - name: "🧹 Free disk space"
-        run: |
-          echo "🧹 Before cleanup:"
-          df -h /
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/graalvm
-          sudo rm -rf /usr/local/share/chromium
-          sudo rm -rf /usr/local/lib/node_modules
-          sudo rm -rf /opt/microsoft/msedge
-          sudo rm -rf /opt/microsoft/powershell
-          sudo rm -rf /opt/pipx
-          sudo rm -rf /usr/lib/mono
-          sudo rm -rf /usr/lib/heroku
-          sudo rm -rf /usr/lib/google-cloud-sdk
-          sudo rm -rf /usr/share/miniconda
-          sudo rm -rf /usr/share/az_*
-          sudo rm -rf /usr/share/gradle-*
-          sudo rm -rf /usr/share/sbt
-          sudo rm -rf /usr/local/julia*
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          sudo docker image prune --all --force 2>/dev/null || true
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-          echo "✅ After cleanup:"
-          df -h /
+      # ──────────────────────────────────────────────
+      # 1. Install build dependencies
+      # ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      # ============================================
-      # 2. Install dependencies
-      # ============================================
-      - name: "📦 Install build dependencies"
+      - name: Install Dependencies
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y \
-            git-core gnupg flex bison build-essential zip curl \
-            zlib1g-dev libc6-dev-i386 libncurses6 libncurses-dev \
-            lib32ncurses-dev lib32z1-dev \
-            x11proto-core-dev libx11-dev libgl1-mesa-dev \
-            libxml2-utils xsltproc unzip fontconfig python3 python3-pip \
-            bc cpio kmod libelf-dev libssl-dev \
-            lld llvm
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf \
+            imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev liblz4-tool libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+            lzop pngcrush rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev python3 python-is-python3 \
+            wget cpio
 
-      # ============================================
+      # ──────────────────────────────────────────────
+      # 2. Setup ccache for faster rebuilds
+      # ──────────────────────────────────────────────
+      - name: Setup ccache
+        run: |
+          ccache -M 10G
+          echo "/usr/lib/ccache" >> $GITHUB_PATH
+
+      # ──────────────────────────────────────────────
       # 3. Clone kernel source
-      # ============================================
-      - name: "📥 Clone kernel source"
+      # ──────────────────────────────────────────────
+      - name: Clone Kernel Source
         run: |
           git clone --depth=1 \
             -b ${{ github.event.inputs.KERNEL_BRANCH }} \
             ${{ github.event.inputs.KERNEL_SOURCE }} \
             kernel_source
+
+      # ──────────────────────────────────────────────
+      # 4. Clone SukiSU-Ultra into kernel tree
+      # ──────────────────────────────────────────────
+      - name: Clone SukiSU-Ultra
+        run: |
           cd kernel_source
-          echo "KERNEL_VERSION=$(make kernelversion 2>/dev/null)" >> $GITHUB_ENV
-          echo "KERNEL_ROOT=$(pwd)" >> $GITHUB_ENV
+          git clone --depth=1 \
+            -b ${{ github.event.inputs.SUKISU_BRANCH }} \
+            https://github.com/SukiSU-Ultra/SukiSU-Ultra.git \
+            KernelSU
+          # Create symlink so the build system picks it up
+          ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
 
-      # ============================================
-      # 4. Setup ZyC Clang 15.0.7 toolchain
-      # ============================================
-      - name: "🔧 Setup ZyC Clang toolchain"
+      # ──────────────────────────────────────────────
+      # 5. Setup SukiSU-Ultra (hook method, KPM, LTO)
+      # ──────────────────────────────────────────────
+      - name: Setup SukiSU-Ultra
         run: |
-          mkdir -p $GITHUB_WORKSPACE/toolchains/clang
-          CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/15.0.7-20260507-release/Clang-15.0.7-20260507.tar.gz"
-          echo "📥 Downloading ZyC Clang 15.0.7..."
-          wget -q "$CLANG_URL" -O clang.tar.gz
-          tar -C $GITHUB_WORKSPACE/toolchains/clang -zxf clang.tar.gz
-          rm clang.tar.gz
-          echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
-          $GITHUB_WORKSPACE/toolchains/clang/bin/clang --version
+          cd kernel_source
 
-      # ============================================
-      # 5. Integrate SukiSU-Ultra
-      # ============================================
-      - name: "🔐 Integrate SukiSU-Ultra"
-        working-directory: kernel_source
-        run: |
-          echo "🔐 Integrating SukiSU-Ultra (branch: ${{ github.event.inputs.SUKISU_BRANCH }})..."
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
-            | bash -s ${{ github.event.inputs.SUKISU_BRANCH }}
-          if [ -d "KernelSU" ]; then
-            echo "✅ SukiSU-Ultra integrated successfully!"
-            SUKISU_VERSION=$(cd KernelSU && git log -1 --format="%h")
-            echo "SUKISU_VERSION=$SUKISU_VERSION" >> $GITHUB_ENV
+          # ── Add kernelsu to drivers Makefile ──
+          if ! grep -q "kernelsu" drivers/Makefile; then
+            echo "obj-y += kernelsu/" >> drivers/Makefile
+          fi
+
+          # ── Apply hook method patches ──
+          HOOK="${{ github.event.inputs.HOOK_METHOD }}"
+          if [ "$HOOK" = "manual" ]; then
+            echo "[*] Applying manual hook patches..."
+            # Apply the SukiSU manual hook patches if available
+            if [ -f KernelSU/kernel/setup.sh ]; then
+              bash KernelSU/kernel/setup.sh
+            fi
+            # Enable manual hook in defconfig
+            echo "CONFIG_KSU=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
           else
-            echo "❌ SukiSU-Ultra integration failed!"
-            exit 1
+            echo "[*] Using kprobe hook method..."
+            echo "CONFIG_KSU=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            echo "CONFIG_KPROBES=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            echo "CONFIG_HAVE_KPROBES=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            echo "CONFIG_KPROBE_EVENTS=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
           fi
 
-      # ============================================
-      # 5.1. Source fix: qcacld-3.0 header
-      # ============================================
-      - name: "🩹 Fix qcacld-3.0 header mismatch"
-        working-directory: kernel_source
+          # ── Enable KPM if requested ──
+          if [ "${{ github.event.inputs.ENABLE_KPM }}" = "true" ]; then
+            echo "[*] Enabling KPM (Kernel Patch Module)..."
+            echo "CONFIG_KPM=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            echo "CONFIG_MODULES=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            echo "CONFIG_MODULE_UNLOAD=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+          fi
+
+          # ── Disable LTO if requested ──
+          if [ "${{ github.event.inputs.DISABLE_LTO }}" = "true" ]; then
+            echo "[*] Disabling LTO..."
+            sed -i 's/CONFIG_LTO=y/CONFIG_LTO=n/' arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_CLANG=n/' arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            sed -i 's/CONFIG_THINLTO=y/CONFIG_THINLTO=n/' arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            echo "CONFIG_LTO_NONE=y" >> arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}
+          fi
+
+      # ──────────────────────────────────────────────
+      # 6. Setup Clang toolchain
+      # ──────────────────────────────────────────────
+      - name: Setup Clang Toolchain
         run: |
-          echo "🩹 Fixing -Warray-parameter in qcacld-3.0 header..."
-          HEADER="drivers/staging/qcacld-3.0/core/mac/src/include/parser_api.h"
-          if [ -f "$HEADER" ]; then
-            sed -i 's/uint8_t mdie\[\]/uint8_t mdie[SIR_MDIE_SIZE]/' "$HEADER"
-            echo "✅ Patched $HEADER"
+          mkdir -p ~/clang
+          # Download Neutron Clang (widely used for Android kernel builds)
+          CLANG_URL="https://raw.githubusercontent.com/nicholaschum/magiskboot_build/main/.github/workflows/build.yml"
+          # Use ZyC clang or AOSP clang
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r498229b.tar.gz -O ~/clang/clang.tar.gz || true
+
+          # Fallback: use system clang + GCC cross-compiler
+          if [ ! -f ~/clang/clang.tar.gz ] || [ ! -s ~/clang/clang.tar.gz ]; then
+            echo "[*] Using system clang toolchain..."
+            sudo apt-get install -y clang lld llvm gcc-aarch64-linux-gnu
+            echo "USE_SYSTEM_CLANG=true" >> $GITHUB_ENV
           else
-            echo "⏭️ $HEADER not found, skipping"
+            tar -xzf ~/clang/clang.tar.gz -C ~/clang/
+            echo "USE_SYSTEM_CLANG=false" >> $GITHUB_ENV
           fi
 
-      # ============================================
-      # 5.2. Source fix: rmnet_ipa.c enum casts
-      # ============================================
-      - name: "🩹 Fix rmnet_ipa.c enum type casts"
-        working-directory: kernel_source
+          # Also get GCC cross-compiler
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      # ──────────────────────────────────────────────
+      # 7. Build the kernel
+      # ──────────────────────────────────────────────
+      - name: Build Kernel
         run: |
-          echo "🩹 Fixing enum conversions in rmnet_ipa.c..."
-          FILE="techpack/dataipa/drivers/platform/msm/ipa/ipa_v3/rmnet_ipa.c"
-          if [ -f "$FILE" ]; then
-            sed -i 's/q6_ul_flt_rule_ptr->ip = flt_spec_ptr->ip_type;/q6_ul_flt_rule_ptr->ip = (enum ipa_ip_type)flt_spec_ptr->ip_type;/' "$FILE"
-            sed -i 's/q6_ul_flt_rule_ptr->action = flt_spec_ptr->filter_action;/q6_ul_flt_rule_ptr->action = (enum ipa_flt_action)flt_spec_ptr->filter_action;/' "$FILE"
-            echo "✅ Patched $FILE"
+          cd kernel_source
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+
+          if [ "$USE_SYSTEM_CLANG" = "true" ]; then
+            export CC=clang
+            export LD=ld.lld
           else
-            echo "⏭️ $FILE not found, skipping"
+            export PATH="$HOME/clang/bin:$PATH"
+            export CC=clang
+            export LD=ld.lld
           fi
 
-      # ============================================
-      # 5.3. Source fix: sde_hw_dsc_1_2.c
-      # ============================================
-      - name: "🩹 Fix sde_hw_dsc_1_2.c missing return type"
-        working-directory: kernel_source
-        run: |
-          echo "🩹 Fixing -Wimplicit-int in sde_hw_dsc_1_2.c..."
-          FILE="techpack/display/msm/sde/sde_hw_dsc_1_2.c"
-          if [ -f "$FILE" ]; then
-            sed -i 's/^static inline _dsc_subblk_offset/static inline int _dsc_subblk_offset/' "$FILE"
-            echo "✅ Patched $FILE"
-          else
-            echo "⏭️ $FILE not found, skipping"
-          fi
-
-      # ============================================
-      # 5.4. Global Clang 15 compat flag patches
-      # ============================================
-      - name: "🩹 Global Clang 15 compat patches"
-        working-directory: kernel_source
-        run: |
-          echo "🩹 Applying global Clang 15 warning suppression flags..."
-
-          CLANG15_FLAGS=(
-            "-Wno-error=enum-conversion"
-            "-Wno-error=unused-but-set-variable"
-            "-Wno-error=implicit-int"
-            "-Wno-error=implicit-function-declaration"
-            "-Wno-error=sometimes-uninitialized"
-            "-Wno-error=int-conversion"
-          )
-
-          if [ -d "techpack" ]; then
-            find techpack/ -name "Makefile" -o -name "Kbuild" | while read f; do
-              for flag in "${CLANG15_FLAGS[@]}"; do
-                if ! grep -q -- "$flag" "$f"; then
-                  echo "ccflags-y += $flag" >> "$f"
-                fi
-              done
-            done
-            echo "✅ Patched techpack/"
-          fi
-
-          STAGING_FLAGS=(
-            "-Wno-error=array-parameter"
-            "-Wno-error=unused-but-set-variable"
-          )
-
-          if [ -d "drivers/staging" ]; then
-            find drivers/staging/ -name "Kbuild" -o -name "Makefile" | while read f; do
-              for flag in "${STAGING_FLAGS[@]}"; do
-                if ! grep -q -- "$flag" "$f"; then
-                  echo "ccflags-y += $flag" >> "$f"
-                fi
-              done
-            done
-            echo "✅ Patched drivers/staging/"
-          fi
-
-          echo "✅ Global Clang 15 compat patches applied!"
-
-      # ============================================
-      # 6. Apply manual hook patches (if selected)
-      # ============================================
-      - name: "🪝 Apply manual hook patches"
-        if: ${{ github.event.inputs.HOOK_METHOD == 'manual' }}
-        working-directory: kernel_source
-        run: |
-          echo "🪝 Applying manual hook patches..."
-
-          # --- fs/exec.c ---
-          sed -i '/static int do_execveat_common/i \
-          #ifdef CONFIG_KSU\n\
-          extern bool ksu_execveat_hook __read_mostly;\n\
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\n\
-          \t\t\tvoid *envp, int *flags);\n\
-          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\n\
-          \t\t\t\t void *argv, void *envp, int *flags);\n\
-          #endif' fs/exec.c
-
-          sed -i '/int do_execveat_common/,/^{/{/^{/a \
-          #ifdef CONFIG_KSU\n\
-          \tif (unlikely(ksu_execveat_hook))\n\
-          \t\tksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n\
-          \telse\n\
-          \t\tksu_handle_execveat_sucompat(\&fd, \&filename, \&argv, \&envp, \&flags);\n\
-          #endif
-          }' fs/exec.c
-
-          # --- fs/open.c ---
-          sed -i '/long do_faccessat/i \
-          #ifdef CONFIG_KSU\n\
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,\n\
-          \t\t\t int *flags);\n\
-          #endif' fs/open.c
-
-          sed -i '/long do_faccessat/,/^{/{/^{/a \
-          #ifdef CONFIG_KSU\n\
-          \tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\n\
-          #endif
-          }' fs/open.c
-
-          # --- fs/read_write.c ---
-          sed -i '/ssize_t vfs_read/i \
-          #ifdef CONFIG_KSU\n\
-          extern bool ksu_vfs_read_hook __read_mostly;\n\
-          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\n\
-          \t\t\tsize_t *count_ptr, loff_t **pos);\n\
-          #endif' fs/read_write.c
-
-          sed -i '/ssize_t vfs_read/,/^{/{/^{/a \
-          #ifdef CONFIG_KSU\n\
-          \tif (unlikely(ksu_vfs_read_hook))\n\
-          \t\tksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);\n\
-          #endif
-          }' fs/read_write.c
-
-          # --- fs/stat.c ---
-          sed -i '/int vfs_statx/i \
-          #ifdef CONFIG_KSU\n\
-          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n\
-          #endif' fs/stat.c
-
-          sed -i '/int vfs_statx/,/^{/{/^{/a \
-          #ifdef CONFIG_KSU\n\
-          \tksu_handle_stat(\&dfd, \&filename, \&flags);\n\
-          #endif
-          }' fs/stat.c
-
-          # --- drivers/input/input.c ---
-          sed -i '/static void input_handle_event/i \
-          #ifdef CONFIG_KSU\n\
-          extern bool ksu_input_hook __read_mostly;\n\
-          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n\
-          #endif' drivers/input/input.c
-
-          sed -i '/int disposition = input_get_disposition/a \
-          #ifdef CONFIG_KSU\n\
-          \tif (unlikely(ksu_input_hook))\n\
-          \t\tksu_handle_input_handle_event(\&type, \&code, \&value);\n\
-          #endif' drivers/input/input.c
-
-          # --- fs/devpts/inode.c ---
-          sed -i '/void \*devpts_get_priv/i \
-          #ifdef CONFIG_KSU\n\
-          extern int ksu_handle_devpts(struct inode*);\n\
-          #endif' fs/devpts/inode.c
-
-          sed -i '/void \*devpts_get_priv/,/^{/{/^{/a \
-          #ifdef CONFIG_KSU\n\
-          \tksu_handle_devpts(dentry->d_inode);\n\
-          #endif
-          }' fs/devpts/inode.c
-
-          echo "✅ Manual hook patches applied!"
-
-      # ============================================
-      # 7. Configure kernel defconfig
-      # ============================================
-      - name: "⚙️ Configure kernel"
-        working-directory: kernel_source
-        run: |
-          make -j$(nproc) O=out ARCH=arm64 \
+          # Generate defconfig
+          make O=out \
+            ARCH=arm64 \
             CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
             ${{ github.event.inputs.KERNEL_DEFCONFIG }}
 
-          echo "" >> out/.config
-          echo "# SukiSU-Ultra configs" >> out/.config
-          echo "CONFIG_KSU=y" >> out/.config
-          echo "# CONFIG_KSU_SUSFS is not set" >> out/.config
-
-          if [ "${{ github.event.inputs.HOOK_METHOD }}" = "manual" ]; then
-            echo "CONFIG_KSU_MANUAL_HOOK=y" >> out/.config
-            echo "# CONFIG_KPROBES is not set" >> out/.config
-          else
-            echo "CONFIG_KPROBES=y" >> out/.config
-            echo "CONFIG_HAVE_KPROBES=y" >> out/.config
-            echo "CONFIG_KPROBE_EVENTS=y" >> out/.config
-          fi
-
-          if [ "${{ github.event.inputs.ENABLE_KPM }}" = "true" ]; then
-            echo "CONFIG_KPM=y" >> out/.config
-            echo "CONFIG_KALLSYMS=y" >> out/.config
-            echo "CONFIG_KALLSYMS_ALL=y" >> out/.config
-          fi
-
-          if [ "${{ github.event.inputs.DISABLE_LTO }}" = "true" ]; then
-            sed -i 's/CONFIG_LTO=y/# CONFIG_LTO is not set/g' out/.config
-            sed -i 's/CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/g' out/.config
-            sed -i 's/CONFIG_THINLTO=y/# CONFIG_THINLTO is not set/g' out/.config
-            echo "CONFIG_LTO_NONE=y" >> out/.config
-          fi
-
-          make -j$(nproc) O=out ARCH=arm64 \
+          # Build kernel
+          make O=out \
+            ARCH=arm64 \
             CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            olddefconfig
-
-      # ============================================
-      # 8. Build kernel
-      # ============================================
-      - name: "🔨 Build kernel"
-        working-directory: kernel_source
-        run: |
-          echo "🔨 Starting kernel build..."
-          START_TIME=$(date +%s)
-
-          make -j$(nproc) O=out ARCH=arm64 \
-            CC=clang \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
             LD=ld.lld \
             AR=llvm-ar \
             NM=llvm-nm \
             OBJCOPY=llvm-objcopy \
             OBJDUMP=llvm-objdump \
             STRIP=llvm-strip \
-            2>&1 | tee build.log
+            -j$(nproc --all)
 
-          END_TIME=$(date +%s)
-          ELAPSED=$((END_TIME - START_TIME))
-          echo "⏱️ Build time: $((ELAPSED / 60))m $((ELAPSED % 60))s"
-
-          if [ -f "out/arch/arm64/boot/Image" ]; then
-            echo "✅ Kernel Image built successfully!"
+          # Verify kernel image was built
+          if [ -f out/arch/arm64/boot/Image ]; then
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image" >> $GITHUB_ENV
-          elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            echo "✅ Kernel Image.gz built successfully!"
+            echo "[✓] Kernel Image built successfully!"
+          elif [ -f out/arch/arm64/boot/Image.gz ]; then
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz" >> $GITHUB_ENV
-          elif [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
-            echo "✅ Kernel Image.gz-dtb built successfully!"
+            echo "[✓] Kernel Image.gz built successfully!"
+          elif [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz-dtb" >> $GITHUB_ENV
+            echo "[✓] Kernel Image.gz-dtb built successfully!"
           else
-            echo "❌ Kernel build failed!"
-            tail -100 build.log
+            echo "[✗] Kernel build failed! No Image found."
+            ls -la out/arch/arm64/boot/ || true
             exit 1
           fi
 
-      # ============================================
-      # 9. Create boot.img with magiskboot
-      # ============================================
-      - name: "🥾 Create flashable boot.img"
+      # ──────────────────────────────────────────────
+      # 8. Download stock boot.img
+      # ──────────────────────────────────────────────
+      - name: Download Stock boot.img
         run: |
-          echo "🥾 Creating boot.img using magiskboot..."
+          wget -q "${{ github.event.inputs.STOCK_BOOT_URL }}" -O stock_boot.img
+          echo "[✓] Downloaded stock boot.img ($(stat -c%s stock_boot.img) bytes)"
 
-          # --- Download magiskboot ---
+      # ──────────────────────────────────────────────
+      # 9. Download magiskboot (Linux x86_64)
+      # ──────────────────────────────────────────────
+      - name: Download magiskboot
+        run: |
+          # Try multiple sources for magiskboot Linux binary
           MAGISKBOOT_URL="https://github.com/nicholaschum/magiskboot_build/releases/latest/download/magiskboot-x86_64"
-          mkdir -p $GITHUB_WORKSPACE/tools
-          wget -q "$MAGISKBOOT_URL" -O $GITHUB_WORKSPACE/tools/magiskboot || {
-            echo "⚠️ magiskboot download failed, trying alternative..."
-            MAGISKBOOT_URL="https://github.com/AviraxP/magiskboot_build/releases/latest/download/magiskboot-x86_64"
-            wget -q "$MAGISKBOOT_URL" -O $GITHUB_WORKSPACE/tools/magiskboot
+          wget -q "$MAGISKBOOT_URL" -O magiskboot || {
+            echo "[*] Trying alternative magiskboot source..."
+            # Alternative: build from topjohnwu's Magisk or use another prebuilt
+            MAGISKBOOT_URL2="https://github.com/nicholaschum/magiskboot_build/releases/download/v30.0/magiskboot-x86_64"
+            wget -q "$MAGISKBOOT_URL2" -O magiskboot
           }
-          chmod +x $GITHUB_WORKSPACE/tools/magiskboot
-          MAGISKBOOT="$GITHUB_WORKSPACE/tools/magiskboot"
+          chmod +x magiskboot
+          echo "[✓] magiskboot ready"
+          ./magiskboot || true
 
-          # --- Download stock boot.img for lisa (PixelExperience Android 13) ---
-          # We need the stock boot.img to extract ramdisk, then replace kernel
-          # Alternative: use mkbootimg with empty ramdisk for header v3
-          echo "📥 Setting up mkbootimg..."
-          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg $GITHUB_WORKSPACE/tools/mkbootimg
-
-          MKBOOTIMG="$GITHUB_WORKSPACE/tools/mkbootimg/mkbootimg.py"
-          UNPACK_BOOTIMG="$GITHUB_WORKSPACE/tools/mkbootimg/unpack_bootimg.py"
-
-          # --- Determine kernel image path ---
-          KERNEL_IMG=""
-          if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image" ]; then
-            KERNEL_IMG="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image"
-          elif [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz" ]; then
-            KERNEL_IMG="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz"
-          elif [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb" ]; then
-            KERNEL_IMG="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb"
-          fi
-
-          echo "📋 Kernel image: $KERNEL_IMG ($(du -h "$KERNEL_IMG" | cut -f1))"
-
-          # --- Collect DTB files ---
-          DTB_FILE=""
-          DTB_DIR="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom"
-          if [ -d "$DTB_DIR" ]; then
-            DTB_COUNT=$(find "$DTB_DIR" -name "*.dtb" | wc -l)
-            if [ "$DTB_COUNT" -gt 0 ]; then
-              # Concatenate all DTBs into one file
-              find "$DTB_DIR" -name "*.dtb" -exec cat {} + > $GITHUB_WORKSPACE/dtb.img
-              DTB_FILE="$GITHUB_WORKSPACE/dtb.img"
-              echo "✅ Combined $DTB_COUNT DTB files into dtb.img"
-            fi
-          fi
-
-          # --- Collect DTBO ---
-          DTBO_FILE=""
-          if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img" ]; then
-            DTBO_FILE="$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img"
-            echo "✅ Found dtbo.img"
-          fi
-
-          # --- Create empty ramdisk ---
-          # Lisa with Android 13 uses boot header v3+
-          # Ramdisk is in vendor_boot, so boot.img ramdisk can be empty
-          mkdir -p /tmp/empty_ramdisk
-          cd /tmp/empty_ramdisk
-          mkdir -p proc sys dev
-          find . | cpio -o -H newc 2>/dev/null | gzip > $GITHUB_WORKSPACE/ramdisk.cpio.gz
-          cd $GITHUB_WORKSPACE
-
-          # --- Build boot.img ---
-          # Lisa (SM7325/yupik) PixelExperience Android 13 uses header v3
-          CMDLINE="console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 androidboot.memcg=1 lpm_levels.sleep_disabled=1 msm_rtb.filter=0x237 service_locator.enable=1 androidboot.usbcontroller=a600000.dwc3 swiotlb=0 loop.max_part=7 cgroup.memory=nokmem,nosocket iptable_raw.raw_before_defrag=1 ip6table_raw.raw_before_defrag=1 firmware_class.path=/vendor/firmware"
-
-          echo "🔨 Creating boot.img (header v3)..."
-          python3 $MKBOOTIMG \
-            --header_version 3 \
-            --kernel "$KERNEL_IMG" \
-            --ramdisk "$GITHUB_WORKSPACE/ramdisk.cpio.gz" \
-            --cmdline "$CMDLINE" \
-            --os_version 13.0.0 \
-            --os_patch_level 2023-10 \
-            --output "$GITHUB_WORKSPACE/boot.img"
-
-          if [ -f "$GITHUB_WORKSPACE/boot.img" ]; then
-            echo "✅ boot.img created successfully!"
-            ls -lh "$GITHUB_WORKSPACE/boot.img"
-            echo "BOOT_IMG=$GITHUB_WORKSPACE/boot.img" >> $GITHUB_ENV
-          else
-            echo "❌ boot.img creation failed!"
-            exit 1
-          fi
-
-          # --- Also create dtbo.img artifact if available ---
-          if [ -n "$DTBO_FILE" ]; then
-            cp "$DTBO_FILE" "$GITHUB_WORKSPACE/dtbo.img"
-            echo "DTBO_IMG=$GITHUB_WORKSPACE/dtbo.img" >> $GITHUB_ENV
-          fi
-
-          # --- Also export dtb.img if available ---
-          if [ -n "$DTB_FILE" ]; then
-            echo "DTB_IMG=$DTB_FILE" >> $GITHUB_ENV
-          fi
-
-      # ============================================
-      # 10. Package with AnyKernel3
-      # ============================================
-      - name: "📦 Package with AnyKernel3"
+      # ──────────────────────────────────────────────
+      # 10. Unpack stock boot.img
+      # ──────────────────────────────────────────────
+      - name: Unpack Stock boot.img
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-          cd AnyKernel3
-          rm -rf ramdisk patch README.md .git .github
+          mkdir -p workdir
+          cp stock_boot.img workdir/
+          cp magiskboot workdir/
+          cd workdir
 
-          cat > anykernel.sh <<'AKEOF'
-          # AnyKernel3 Ramdisk Mod Script
-          # osm0sis @ xda-developers
+          ./magiskboot unpack stock_boot.img
+          echo ""
+          echo "[✓] Unpacked boot.img components:"
+          ls -la
 
-          ## AnyKernel setup
-          # begin properties
-          properties() { '
-          kernel.string=SukiSU-Ultra Kernel for Xiaomi 11 Lite NE 5G (lisa)
-          do.devicecheck=1
-          do.modules=0
-          do.systemless=1
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=lisa
-          device.name2=lisain
-          device.name3=lisapro
-          supported.versions=12 - 15
-          supported.patchlevels=
-          supported.vendorpatchlevels=
-          '; }
+      # ──────────────────────────────────────────────
+      # 11. Replace kernel in unpacked boot
+      # ──────────────────────────────────────────────
+      - name: Replace Kernel
+        run: |
+          cd workdir
 
-          # shell variables
-          BLOCK=/dev/block/bootdevice/by-name/boot;
-          IS_SLOT_DEVICE=1;
-          RAMDISK_COMPRESSION=auto;
-          PATCH_VBMETA_FLAG=auto;
-
-          ## AnyKernel methods (DO NOT CHANGE)
-          . tools/ak3-core.sh;
-
-          ## AnyKernel boot install
-          dump_boot;
-          write_boot;
-          ## end boot install
-          AKEOF
-
-          sed -i 's/^          //' anykernel.sh
-
-          # Copy kernel image
-          if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image" ]; then
-            cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image .
-          elif [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz" ]; then
-            cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz .
-          elif [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb" ]; then
-            cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image.gz-dtb .
+          # Back up original kernel
+          if [ -f kernel ]; then
+            cp kernel kernel.orig
+            echo "[*] Original kernel size: $(stat -c%s kernel) bytes"
           fi
 
-          # Copy DTBs
-          mkdir -p dtbs
-          if [ -d "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom" ]; then
-            find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts/vendor/qcom \
-              -name "*.dtb" -exec cp {} dtbs/ \; 2>/dev/null || true
-          fi
+          # Copy newly built kernel image
+          cp ../kernel_source/${{ env.KERNEL_IMAGE }} kernel
+          echo "[✓] Replaced kernel with custom build ($(stat -c%s kernel) bytes)"
 
-          # Copy DTBO
-          if [ -f "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img" ]; then
-            cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dtbo.img .
-          fi
+      # ──────────────────────────────────────────────
+      # 12. Repack boot.img using magiskboot
+      # ──────────────────────────────────────────────
+      - name: Repack boot.img
+        run: |
+          cd workdir
 
-          echo "📋 Files in AnyKernel3:"
-          ls -la Image* dtb* 2>/dev/null || true
+          ./magiskboot repack stock_boot.img new-boot.img
+          echo ""
+          echo "[✓] Repacked boot.img successfully!"
+          echo "    Original: $(stat -c%s stock_boot.img) bytes"
+          echo "    New:      $(stat -c%s new-boot.img) bytes"
 
-          ZIPNAME="SukiSU-Ultra-lisa-${{ env.KERNEL_VERSION }}-$(date +%Y%m%d).zip"
-          zip -r9 "../$ZIPNAME" * -x '*.git*'
-          echo "ZIP_NAME=$ZIPNAME" >> $GITHUB_ENV
-          echo "✅ AnyKernel3 zip created: $ZIPNAME"
-          ls -lh "../$ZIPNAME"
+          # Copy to workspace root for artifact upload
+          cp new-boot.img ../new-boot.img
 
-      # ============================================
-      # 11. Upload artifacts
-      # ============================================
-      - name: "📤 Upload AnyKernel3 zip"
+      # ──────────────────────────────────────────────
+      # 13. Upload boot.img as GitHub Actions artifact
+      # ──────────────────────────────────────────────
+      - name: Upload boot.img Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ZIP_NAME }}
-          path: ${{ env.ZIP_NAME }}
+          name: boot-img-sukisu-${{ github.run_number }}
+          path: new-boot.img
           retention-days: 7
 
-      - name: "📤 Upload boot.img"
-        uses: actions/upload-artifact@v4
-        with:
-          name: boot-img-lisa-sukisu
-          path: ${{ env.BOOT_IMG }}
-          retention-days: 7
+      # ──────────────────────────────────────────────
+      # 14. Create GitHub Release with the new boot.img
+      # ──────────────────────────────────────────────
+      - name: Generate Release Tag
+        run: |
+          echo "RELEASE_TAG=v$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
+          echo "RELEASE_DATE=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_ENV
 
-      - name: "📤 Upload dtbo.img"
-        if: env.DTBO_IMG != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: dtbo-img-lisa
-          path: ${{ env.DTBO_IMG }}
-          retention-days: 7
-
-      - name: "📤 Upload kernel image"
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-image-lisa
-          path: kernel_source/${{ env.KERNEL_IMAGE }}
-          retention-days: 7
-
-      - name: "📤 Upload build log"
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: kernel_source/build.log
-          retention-days: 3
-
-      # ============================================
-      # 12. Create GitHub Release
-      # ============================================
-      - name: "🚀 Create GitHub Release"
-        if: success()
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.KERNEL_VERSION }}-sukisu-${{ env.SUKISU_VERSION }}-${{ github.run_number }}
-          name: "Lisa Kernel ${{ env.KERNEL_VERSION }} + SukiSU-Ultra"
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "SukiSU-Ultra Kernel Boot Image - ${{ env.RELEASE_DATE }}"
           body: |
-            ## 📱 Kernel for Xiaomi 11 Lite NE 5G (lisa)
+            ## 🔧 Build Configuration
+            | Setting | Value |
+            |---------|-------|
+            | **Kernel Source** | `${{ github.event.inputs.KERNEL_SOURCE }}` |
+            | **Branch** | `${{ github.event.inputs.KERNEL_BRANCH }}` |
+            | **Defconfig** | `${{ github.event.inputs.KERNEL_DEFCONFIG }}` |
+            | **SukiSU Branch** | `${{ github.event.inputs.SUKISU_BRANCH }}` |
+            | **Hook Method** | `${{ github.event.inputs.HOOK_METHOD }}` |
+            | **KPM Enabled** | `${{ github.event.inputs.ENABLE_KPM }}` |
+            | **LTO Disabled** | `${{ github.event.inputs.DISABLE_LTO }}` |
+            | **Stock boot.img** | `${{ github.event.inputs.STOCK_BOOT_URL }}` |
 
-            | Property | Value |
-            |---|---|
-            | **Kernel** | ${{ env.KERNEL_VERSION }} |
-            | **SukiSU-Ultra** | ${{ env.SUKISU_VERSION }} (${{ github.event.inputs.SUKISU_BRANCH }}) |
-            | **Defconfig** | ${{ github.event.inputs.KERNEL_DEFCONFIG }} |
-            | **Hook Method** | ${{ github.event.inputs.HOOK_METHOD }} |
-            | **KPM** | ${{ github.event.inputs.ENABLE_KPM }} |
-            | **Clang** | ZyC 15.0.7 |
+            ## 📦 Files
+            - `new-boot.img` — Repacked boot image with SukiSU-Ultra kernel
 
-            ### 📦 Downloads
-            | File | Usage |
-            |---|---|
-            | `SukiSU-Ultra-lisa-*.zip` | Flash via TWRP/Recovery |
-            | `boot.img` | Flash via `fastboot flash boot boot.img` |
-            | `dtbo.img` | Flash via `fastboot flash dtbo dtbo.img` (if needed) |
-
-            ### ⚡ Flash Instructions
-
-            **Method 1 — Recovery (AnyKernel3):**
-            1. Boot into TWRP / custom recovery
-            2. Flash the `SukiSU-Ultra-lisa-*.zip`
-            3. Reboot & install SukiSU-Ultra Manager
-
-            **Method 2 — Fastboot (boot.img):**
-            1. Reboot to bootloader: `adb reboot bootloader`
-            2. Flash boot image: `fastboot flash boot boot.img`
-            3. (Optional) Flash dtbo: `fastboot flash dtbo dtbo.img`
-            4. Reboot: `fastboot reboot`
-            5. Install SukiSU-Ultra Manager
-
-            > ⚠️ **Tip:** Test first with `fastboot boot boot.img` (temporary boot) before permanent flash.
-          files: |
-            ${{ env.ZIP_NAME }}
-            ${{ env.BOOT_IMG }}
-          draft: false
-          prerelease: false
+            ## 🚀 Flash Instructions
+            ```bash
+            fastboot flash boot new-boot.img
+            ```
+          files: new-boot.img
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
