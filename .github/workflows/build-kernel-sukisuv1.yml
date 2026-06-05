@@ -498,6 +498,7 @@ jobs:
               CROSS_COMPILE=aarch64-linux-gnu- \
               CC=clang \
               CLANG_TRIPLE=aarch64-linux-gnu- \
+              KCFLAGS="-Wno-error=enum-conversion -Wno-error=enum-compare -Wno-error=single-bit-bitfield-constant-conversion" \
               Image 2>&1 | tee build.log; BUILD_EXIT=${PIPESTATUS[0]}
           fi
           
