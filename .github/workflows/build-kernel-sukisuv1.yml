@@ -1,0 +1,700 @@
+###############################################################################
+# Build Kernel with SukiSU-Ultra & Repack boot.img
+# Updated: Manual hook patches + Auto-fix touchscreen + kernel modules
+# Device: Xiaomi 11 Lite NE 5G (lisa) / Snapdragon 778G / Lahaina
+# Kernel: 5.4.x (non-GKI)
+###############################################################################
+
+name: Build Kernel with SukiSU-Ultra & Repack boot.img (TouchFix)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_SOURCE:
+        description: "Kernel source repository URL"
+        required: true
+        default: "https://github.com/PixelExperience-Devices/kernel_xiaomi_lisa"
+      KERNEL_BRANCH:
+        description: "Kernel source branch"
+        required: true
+        default: "thirteen"
+      KERNEL_DEFCONFIG:
+        description: "Defconfig file"
+        required: true
+        default: "lisa_defconfig"
+      SUKISU_BRANCH:
+        description: "SukiSU-Ultra branch (main / builtin / susfs-dev)"
+        required: true
+        default: "main"
+      ENABLE_KPM:
+        description: "Enable KPM (Kernel Patch Module)"
+        required: false
+        default: true
+        type: boolean
+      DISABLE_LTO:
+        description: "Disable LTO (Link Time Optimization)"
+        required: false
+        default: false
+        type: boolean
+      FIX_TOUCHSCREEN:
+        description: "Auto-fix touchscreen (change touch drivers from =m to =y)"
+        required: false
+        default: true
+        type: boolean
+      STOCK_BOOT_URL:
+        description: "Stock boot.img URL for repacking"
+        required: true
+        default: "https://github.com/tungnt017/build-kernel-sukisu/releases/download/2.0/boot.img"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Kernel & Repack boot.img
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      ########################################################################
+      # 1. Checkout this repository (for any local scripts/patches)
+      ########################################################################
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      ########################################################################
+      # 2. Setup build environment
+      ########################################################################
+      - name: Setup build environment
+        run: |
+          echo "========== Installing build dependencies =========="
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl \
+            flex git kmod libelf-dev libssl-dev lld llvm \
+            make python3 tar unzip wget zip zstd \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          echo "========== Build tools installed =========="
+
+      ########################################################################
+      # 3. Clone kernel source
+      ########################################################################
+      - name: Clone kernel source
+        run: |
+          echo "========== Cloning kernel source =========="
+          git clone --depth=1 \
+            -b ${{ github.event.inputs.KERNEL_BRANCH }} \
+            ${{ github.event.inputs.KERNEL_SOURCE }} \
+            kernel_source
+          echo "Kernel source cloned successfully."
+
+      ########################################################################
+      # 4. Setup Clang toolchain
+      ########################################################################
+      - name: Setup Clang toolchain
+        run: |
+          echo "========== Setting up Clang toolchain =========="
+          mkdir -p toolchain
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r530567.tar.gz -O clang.tar.gz || true
+          if [ ! -f clang.tar.gz ] || [ ! -s clang.tar.gz ]; then
+            echo "Falling back to system clang + GCC cross-compiler"
+            echo "USE_SYSTEM_CLANG=true" >> $GITHUB_ENV
+          else
+            mkdir -p toolchain/clang
+            tar -xzf clang.tar.gz -C toolchain/clang
+            echo "USE_SYSTEM_CLANG=false" >> $GITHUB_ENV
+          fi
+
+      ########################################################################
+      # 5. Integrate SukiSU-Ultra into kernel source
+      ########################################################################
+      - name: Integrate SukiSU-Ultra
+        working-directory: kernel_source
+        run: |
+          echo "========== Integrating SukiSU-Ultra (${{ github.event.inputs.SUKISU_BRANCH }}) =========="
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s ${{ github.event.inputs.SUKISU_BRANCH }}
+          echo "SukiSU-Ultra integrated successfully."
+
+      ########################################################################
+      # 6. Apply manual hook patches (NOT kprobe)
+      #
+      #    For non-GKI kernels (like lisa 5.4.x), kprobe is unreliable.
+      #    We must manually patch kernel source files to add KSU hooks.
+      #    Reference: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html
+      #
+      #    Files patched:
+      #      a) fs/exec.c         - Hook do_execveat_common()
+      #      b) fs/open.c         - Hook do_faccessat()
+      #      c) fs/read_write.c   - Hook vfs_read()
+      #      d) fs/stat.c         - Hook vfs_statx() / vfs_fstatat()
+      #      e) drivers/input/input.c  - Hook input_handle_event() (Safe Mode)
+      #      f) fs/devpts/inode.c - Hook devpts_get_priv() (Fix PM command)
+      ########################################################################
+      - name: "Apply manual hook patches (NOT kprobe)"
+        working-directory: kernel_source
+        run: |
+          echo "========== Applying KSU manual hook patches =========="
+          echo ""
+          echo "Non-GKI kernel (5.4.x) -> kprobe is unreliable."
+          echo "Applying manual hooks to kernel source files..."
+          echo ""
+
+          PATCH_COUNT=0
+          PATCH_FAIL=0
+
+          ################################################################
+          # a) Patch fs/exec.c - Hook do_execveat_common()
+          ################################################################
+          echo ">>> [1/6] Patching fs/exec.c ..."
+
+          # Insert extern declarations before do_execveat_common
+          sed -i '/^static int do_execveat_common/i \
+          #ifdef CONFIG_KSU\
+          extern bool ksu_execveat_hook __read_mostly;\
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\
+          \t\t\tvoid *envp, int *flags);\
+          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\
+          \t\t\t\t void *argv, void *envp, int *flags);\
+          #endif' fs/exec.c
+
+          # Insert hook call at the beginning of do_execveat_common function body
+          # Find the opening brace of do_execveat_common and insert after it
+          sed -i '/^static int do_execveat_common/,/{/ {
+            /^{/a \
+          #ifdef CONFIG_KSU\
+          \tif (unlikely(ksu_execveat_hook))\
+          \t\tksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\
+          \telse\
+          \t\tksu_handle_execveat_sucompat(\&fd, \&filename, \&argv, \&envp, \&flags);\
+          #endif
+          }' fs/exec.c
+
+          if grep -q "ksu_handle_execveat" fs/exec.c; then
+            echo "    ✅ fs/exec.c patched successfully"
+            PATCH_COUNT=$((PATCH_COUNT + 1))
+          else
+            echo "    ❌ fs/exec.c patch FAILED"
+            PATCH_FAIL=$((PATCH_FAIL + 1))
+          fi
+
+          ################################################################
+          # b) Patch fs/open.c - Hook do_faccessat()
+          ################################################################
+          echo ">>> [2/6] Patching fs/open.c ..."
+
+          # Insert extern declaration before do_faccessat
+          sed -i '/^long do_faccessat/i \
+          #ifdef CONFIG_KSU\
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,\
+          \t\t\t int *flags);\
+          #endif' fs/open.c
+
+          # Insert hook call at the beginning of do_faccessat function body
+          sed -i '/^long do_faccessat/,/{/ {
+            /^{/a \
+          #ifdef CONFIG_KSU\
+          \tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\
+          #endif
+          }' fs/open.c
+
+          if grep -q "ksu_handle_faccessat" fs/open.c; then
+            echo "    ✅ fs/open.c patched successfully"
+            PATCH_COUNT=$((PATCH_COUNT + 1))
+          else
+            echo "    ❌ fs/open.c patch FAILED"
+            PATCH_FAIL=$((PATCH_FAIL + 1))
+          fi
+
+          ################################################################
+          # c) Patch fs/read_write.c - Hook vfs_read()
+          ################################################################
+          echo ">>> [3/6] Patching fs/read_write.c ..."
+
+          # Insert extern declarations before vfs_read
+          sed -i '/^ssize_t vfs_read/i \
+          #ifdef CONFIG_KSU\
+          extern bool ksu_vfs_read_hook __read_mostly;\
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,\
+          \t\t\tsize_t *count_ptr, loff_t **pos);\
+          #endif' fs/read_write.c
+
+          # Insert hook call at the beginning of vfs_read function body
+          sed -i '/^ssize_t vfs_read/,/{/ {
+            /^{/a \
+          #ifdef CONFIG_KSU\
+          \tif (unlikely(ksu_vfs_read_hook))\
+          \t\tksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);\
+          #endif
+          }' fs/read_write.c
+
+          if grep -q "ksu_handle_vfs_read" fs/read_write.c; then
+            echo "    ✅ fs/read_write.c patched successfully"
+            PATCH_COUNT=$((PATCH_COUNT + 1))
+          else
+            echo "    ❌ fs/read_write.c patch FAILED"
+            PATCH_FAIL=$((PATCH_FAIL + 1))
+          fi
+
+          ################################################################
+          # d) Patch fs/stat.c - Hook vfs_statx() or vfs_fstatat()
+          ################################################################
+          echo ">>> [4/6] Patching fs/stat.c ..."
+
+          # Try vfs_statx first (kernel >= 4.11), fallback to vfs_fstatat
+          if grep -q "int vfs_statx(" fs/stat.c; then
+            echo "    Found vfs_statx (kernel >= 4.11)"
+            sed -i '/^int vfs_statx/i \
+          #ifdef CONFIG_KSU\
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\
+          #endif' fs/stat.c
+
+            sed -i '/^int vfs_statx/,/{/ {
+              /^{/a \
+          #ifdef CONFIG_KSU\
+          \tksu_handle_stat(\&dfd, \&filename, \&flags);\
+          #endif
+            }' fs/stat.c
+          elif grep -q "int vfs_fstatat(" fs/stat.c; then
+            echo "    Found vfs_fstatat (older kernel)"
+            sed -i '/^int vfs_fstatat/i \
+          #ifdef CONFIG_KSU\
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\
+          #endif' fs/stat.c
+
+            sed -i '/^int vfs_fstatat/,/{/ {
+              /^{/a \
+          #ifdef CONFIG_KSU\
+          \tksu_handle_stat(\&dfd, \&filename, \&flag);\
+          #endif
+            }' fs/stat.c
+          fi
+
+          if grep -q "ksu_handle_stat" fs/stat.c; then
+            echo "    ✅ fs/stat.c patched successfully"
+            PATCH_COUNT=$((PATCH_COUNT + 1))
+          else
+            echo "    ❌ fs/stat.c patch FAILED"
+            PATCH_FAIL=$((PATCH_FAIL + 1))
+          fi
+
+          ################################################################
+          # e) Patch drivers/input/input.c - Hook input_handle_event()
+          #    (Safe Mode: press volume-down to disable modules on boot)
+          ################################################################
+          echo ">>> [5/6] Patching drivers/input/input.c ..."
+
+          sed -i '/^static void input_handle_event/i \
+          #ifdef CONFIG_KSU\
+          extern bool ksu_input_hook __read_mostly;\
+          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\
+          #endif' drivers/input/input.c
+
+          sed -i '/^static void input_handle_event/,/{/ {
+            /^{/a \
+          #ifdef CONFIG_KSU\
+          \tif (unlikely(ksu_input_hook))\
+          \t\tksu_handle_input_handle_event(\&type, \&code, \&value);\
+          #endif
+          }' drivers/input/input.c
+
+          if grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
+            echo "    ✅ drivers/input/input.c patched successfully"
+            PATCH_COUNT=$((PATCH_COUNT + 1))
+          else
+            echo "    ❌ drivers/input/input.c patch FAILED"
+            PATCH_FAIL=$((PATCH_FAIL + 1))
+          fi
+
+          ################################################################
+          # f) Patch fs/devpts/inode.c - Hook devpts_get_priv()
+          #    (Fix: allow PM commands to work in terminal)
+          ################################################################
+          echo ">>> [6/6] Patching fs/devpts/inode.c ..."
+
+          sed -i '/^void \*devpts_get_priv/i \
+          #ifdef CONFIG_KSU\
+          extern int ksu_handle_devpts(struct inode*);\
+          #endif' fs/devpts/inode.c
+
+          sed -i '/^void \*devpts_get_priv/,/{/ {
+            /^{/a \
+          #ifdef CONFIG_KSU\
+          \tksu_handle_devpts(dentry->d_inode);\
+          #endif
+          }' fs/devpts/inode.c
+
+          if grep -q "ksu_handle_devpts" fs/devpts/inode.c; then
+            echo "    ✅ fs/devpts/inode.c patched successfully"
+            PATCH_COUNT=$((PATCH_COUNT + 1))
+          else
+            echo "    ❌ fs/devpts/inode.c patch FAILED"
+            PATCH_FAIL=$((PATCH_FAIL + 1))
+          fi
+
+          ################################################################
+          # Summary
+          ################################################################
+          echo ""
+          echo "=========================================="
+          echo "  Manual Hook Patches Summary"
+          echo "=========================================="
+          echo "  Successful: ${PATCH_COUNT}/6"
+          echo "  Failed:     ${PATCH_FAIL}/6"
+          echo "=========================================="
+          echo ""
+
+          if [ "$PATCH_FAIL" -gt 0 ]; then
+            echo "⚠️  WARNING: Some patches failed!"
+            echo "   You may need to apply them manually."
+            echo "   Check the kernel source for function signature differences."
+          else
+            echo "✅ All manual hook patches applied successfully!"
+          fi
+
+      ########################################################################
+      # 7. Generate base .config from defconfig
+      ########################################################################
+      - name: Generate base defconfig
+        working-directory: kernel_source
+        run: |
+          echo "========== Generating defconfig =========="
+          DEFCONFIG="${{ github.event.inputs.KERNEL_DEFCONFIG }}"
+          if [ -f "arch/arm64/configs/vendor/${DEFCONFIG}" ]; then
+            DEFCONFIG="vendor/${DEFCONFIG}"
+            echo "Found defconfig at: arch/arm64/configs/vendor/"
+          fi
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            ${DEFCONFIG}
+          echo "Base .config generated."
+
+      ########################################################################
+      # 8. AUTO-FIX TOUCHSCREEN - Convert touch drivers from =m to =y
+      ########################################################################
+      - name: "Fix touchscreen: Convert touch drivers to built-in (=y)"
+        if: ${{ github.event.inputs.FIX_TOUCHSCREEN == 'true' }}
+        working-directory: kernel_source
+        run: |
+          echo "========== AUTO-FIX TOUCHSCREEN =========="
+          CONFIG_FILE="out/.config"
+
+          echo ">>> BEFORE changes (touchscreen-related configs):"
+          grep -iE "TOUCHSCREEN|FOCALTECH|FTS_|GOODIX|GT9[0-9]|NT36|SYNAPTICS|XIAOMI_TOUCH|INPUT_TOUCHSCREEN" \
+            "$CONFIG_FILE" || echo "(no touchscreen configs found)"
+          echo ""
+
+          # Lisa touchscreen drivers:
+          #   focaltech_3658u, focaltech_3680, focaltech_spi, focaltech_touch
+          #   fts_dual, fts_spi, goodix, gt9897t, gt9916
+          #   nt36xxx, synaptics_dsx, synaptics_s3908p, synaptics_tcm
+          #   xiaomi (touch subsystem), st
+          TOUCH_PATTERNS=(
+            "CONFIG_TOUCHSCREEN_"
+            "CONFIG_INPUT_TOUCHSCREEN"
+            "CONFIG_TOUCHSCREEN_FOCALTECH"
+            "CONFIG_TOUCHSCREEN_FTS"
+            "CONFIG_TOUCHSCREEN_GOODIX"
+            "CONFIG_TOUCHSCREEN_GT9"
+            "CONFIG_TOUCHSCREEN_NT36"
+            "CONFIG_TOUCHSCREEN_SYNAPTICS"
+            "CONFIG_TOUCHSCREEN_XIAOMI"
+            "CONFIG_TOUCHSCREEN_ST"
+            "CONFIG_FTS_"
+            "CONFIG_FOCALTECH_"
+          )
+
+          echo ">>> Converting touchscreen modules (=m) to built-in (=y)..."
+          for pattern in "${TOUCH_PATTERNS[@]}"; do
+            sed -i "s/^${pattern}\(.*\)=m/${pattern}\1=y/g" "$CONFIG_FILE" 2>/dev/null || true
+          done
+
+          if grep -q "# CONFIG_INPUT_TOUCHSCREEN is not set" "$CONFIG_FILE"; then
+            sed -i 's/# CONFIG_INPUT_TOUCHSCREEN is not set/CONFIG_INPUT_TOUCHSCREEN=y/' "$CONFIG_FILE"
+          fi
+
+          echo ""
+          echo ">>> AFTER changes (touchscreen-related configs):"
+          grep -iE "TOUCHSCREEN|FOCALTECH|FTS_|GOODIX|GT9[0-9]|NT36|SYNAPTICS|XIAOMI_TOUCH|INPUT_TOUCHSCREEN" \
+            "$CONFIG_FILE" || echo "(no touchscreen configs found)"
+          echo ""
+
+          echo ">>> Running 'make olddefconfig' to resolve dependencies..."
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          echo ""
+          echo ">>> FINAL touchscreen configs after olddefconfig:"
+          grep -iE "TOUCHSCREEN|FOCALTECH|FTS_|GOODIX|GT9[0-9]|NT36|SYNAPTICS|XIAOMI_TOUCH|INPUT_TOUCHSCREEN" \
+            out/.config || echo "(no touchscreen configs found)"
+          echo ""
+          echo "========== Touchscreen fix applied! =========="
+
+      ########################################################################
+      # 9. Apply SukiSU / KPM / LTO kernel configs
+      #    NOTE: Disable CONFIG_KPROBES to prevent accidental safe mode
+      #          triggers when using manual hooks.
+      ########################################################################
+      - name: Apply SukiSU kernel configs
+        working-directory: kernel_source
+        run: |
+          echo "========== Applying SukiSU kernel configs =========="
+          CONFIG_FILE="out/.config"
+
+          # Core SukiSU configs (manual hook for non-GKI)
+          scripts/config --file "$CONFIG_FILE" --enable CONFIG_KSU
+          scripts/config --file "$CONFIG_FILE" --enable CONFIG_KSU_MANUAL_HOOK
+          scripts/config --file "$CONFIG_FILE" --enable CONFIG_KALLSYMS
+          scripts/config --file "$CONFIG_FILE" --enable CONFIG_KALLSYMS_ALL
+
+          # Disable KPROBES to prevent accidental safe mode triggers
+          # when using manual hooks (per KernelSU docs recommendation)
+          scripts/config --file "$CONFIG_FILE" --disable CONFIG_KPROBES
+
+          # KPM (Kernel Patch Module)
+          if [ "${{ github.event.inputs.ENABLE_KPM }}" = "true" ]; then
+            echo "Enabling KPM..."
+            scripts/config --file "$CONFIG_FILE" --enable CONFIG_KPM
+          fi
+
+          # Disable LTO if requested
+          if [ "${{ github.event.inputs.DISABLE_LTO }}" = "true" ]; then
+            echo "Disabling LTO..."
+            scripts/config --file "$CONFIG_FILE" --disable CONFIG_LTO
+            scripts/config --file "$CONFIG_FILE" --disable CONFIG_LTO_CLANG
+            scripts/config --file "$CONFIG_FILE" --enable CONFIG_LTO_NONE
+          fi
+
+          # Regenerate config
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          echo "SukiSU configs applied."
+          echo ""
+          echo ">>> Key configs:"
+          grep -E "CONFIG_KSU|CONFIG_KPM|CONFIG_KALLSYMS|CONFIG_LTO|CONFIG_KPROBES" out/.config | head -20
+
+      ########################################################################
+      # 10. Build kernel Image
+      ########################################################################
+      - name: Build kernel Image
+        working-directory: kernel_source
+        run: |
+          echo "========== Building kernel =========="
+          START_TIME=$(date +%s)
+
+          if [ "$USE_SYSTEM_CLANG" = "true" ]; then
+            make -j$(nproc) O=out ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CC=clang \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              Image 2>&1 | tail -30
+          else
+            export PATH="$(pwd)/../toolchain/clang/bin:$PATH"
+            make -j$(nproc) O=out ARCH=arm64 \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CC=clang \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              Image 2>&1 | tail -30
+          fi
+
+          END_TIME=$(date +%s)
+          ELAPSED=$(( END_TIME - START_TIME ))
+          echo ""
+          echo "========== Kernel build completed in ${ELAPSED}s =========="
+
+          if [ -f out/arch/arm64/boot/Image ]; then
+            echo "✅ Kernel Image built successfully!"
+            ls -lh out/arch/arm64/boot/Image
+          else
+            echo "❌ ERROR: Kernel Image not found!"
+            ls -la out/arch/arm64/boot/ || true
+            exit 1
+          fi
+
+      ########################################################################
+      # 11. Build & collect kernel modules
+      ########################################################################
+      - name: Build and collect kernel modules
+        working-directory: kernel_source
+        run: |
+          echo "========== Building kernel modules =========="
+          mkdir -p ../modules_out
+
+          make -j$(nproc) O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            modules 2>&1 | tail -10 || echo "Module build completed"
+
+          make O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH=../../modules_out \
+            INSTALL_MOD_STRIP=1 \
+            modules_install 2>&1 | tail -10 || echo "Module install completed"
+
+          echo ""
+          echo ">>> All built modules:"
+          find ../modules_out -name "*.ko" -exec basename {} \; | sort || echo "(no modules)"
+
+          echo ""
+          echo ">>> Touchscreen modules (should be EMPTY if fix worked):"
+          find ../modules_out -name "*.ko" | xargs basename -a 2>/dev/null | \
+            grep -iE "touch|focaltech|fts|goodix|gt9|nt36|synaptics" || \
+            echo "✅ No touchscreen .ko modules - they are built-in!"
+
+      ########################################################################
+      # 12. Download stock boot.img
+      ########################################################################
+      - name: Download stock boot.img
+        run: |
+          echo "========== Downloading stock boot.img =========="
+          wget -q "${{ github.event.inputs.STOCK_BOOT_URL }}" -O stock_boot.img
+          ls -lh stock_boot.img
+
+      ########################################################################
+      # 13. Setup magiskboot
+      ########################################################################
+      - name: Setup magiskboot
+        run: |
+          echo "========== Setting up magiskboot =========="
+          MAGISK_URL=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+            | grep "browser_download_url.*Magisk-.*\.apk" \
+            | head -1 | cut -d '"' -f 4)
+
+          if [ -z "$MAGISK_URL" ]; then
+            MAGISK_URL="https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk"
+          fi
+
+          wget -q "$MAGISK_URL" -O magisk.apk
+          unzip -o magisk.apk lib/x86_64/libmagiskboot.so -d magisk_extract
+          mv magisk_extract/lib/x86_64/libmagiskboot.so magiskboot
+          chmod +x magiskboot
+          echo "magiskboot ready."
+
+      ########################################################################
+      # 14. Unpack stock boot.img
+      ########################################################################
+      - name: Unpack stock boot.img
+        run: |
+          mkdir -p boot_workdir
+          cp stock_boot.img boot_workdir/boot.img
+          cd boot_workdir
+          ../magiskboot unpack boot.img
+          echo ">>> Unpacked boot contents:"
+          ls -lh
+
+      ########################################################################
+      # 15. Replace kernel
+      ########################################################################
+      - name: Replace kernel in boot.img
+        run: |
+          cp kernel_source/out/arch/arm64/boot/Image boot_workdir/kernel
+          echo "New kernel copied."
+          ls -lh boot_workdir/kernel
+
+      ########################################################################
+      # 16. Repack boot.img
+      ########################################################################
+      - name: Repack boot.img
+        run: |
+          cd boot_workdir
+          ../magiskboot repack boot.img new_boot.img
+          ls -lh new_boot.img
+          cp new_boot.img ../boot_sukisu.img
+          echo "✅ boot_sukisu.img ready for flashing!"
+
+      ########################################################################
+      # 17. Prepare artifacts
+      ########################################################################
+      - name: Prepare artifacts
+        run: |
+          mkdir -p release_artifacts
+          cp boot_sukisu.img release_artifacts/
+
+          if find modules_out -name "*.ko" 2>/dev/null | head -1 | grep -q "."; then
+            echo "Packaging kernel modules..."
+            cd modules_out
+            tar -czf ../release_artifacts/kernel_modules.tar.gz .
+            cd ..
+          fi
+
+          cat > release_artifacts/BUILD_INFO.txt << EOF
+          ================================================
+          SukiSU-Ultra Kernel Build for Xiaomi Lisa
+          ================================================
+          Build Date:       $(date -u +"%Y-%m-%d %H:%M UTC")
+          Kernel Source:    ${{ github.event.inputs.KERNEL_SOURCE }}
+          Kernel Branch:    ${{ github.event.inputs.KERNEL_BRANCH }}
+          Defconfig:        ${{ github.event.inputs.KERNEL_DEFCONFIG }}
+          SukiSU Branch:    ${{ github.event.inputs.SUKISU_BRANCH }}
+          Hook Method:      Manual Hook (NOT kprobe)
+          KPM Enabled:      ${{ github.event.inputs.ENABLE_KPM }}
+          LTO Disabled:     ${{ github.event.inputs.DISABLE_LTO }}
+          Touch Fix:        ${{ github.event.inputs.FIX_TOUCHSCREEN }}
+
+          PATCHED FILES (manual hooks):
+            - fs/exec.c          (do_execveat_common)
+            - fs/open.c          (do_faccessat)
+            - fs/read_write.c    (vfs_read)
+            - fs/stat.c          (vfs_statx / vfs_fstatat)
+            - drivers/input/input.c (input_handle_event - Safe Mode)
+            - fs/devpts/inode.c  (devpts_get_priv - PM fix)
+
+          FLASH:  fastboot flash boot boot_sukisu.img
+          BACKUP: Always backup stock boot.img first!
+          ================================================
+          EOF
+
+          echo ">>> Release artifacts:"
+          ls -lh release_artifacts/
+
+      ########################################################################
+      # 18. Upload artifact
+      ########################################################################
+      - name: Upload boot.img artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot_sukisu-${{ github.run_number }}
+          path: |
+            release_artifacts/boot_sukisu.img
+            release_artifacts/BUILD_INFO.txt
+            release_artifacts/kernel_modules.tar.gz
+
+      ########################################################################
+      # 19. Create GitHub Release
+      ########################################################################
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}-${{ github.run_id }}
+          name: "SukiSU-Ultra Kernel Build #${{ github.run_number }}"
+          body: |
+            ## SukiSU-Ultra Kernel for Xiaomi 11 Lite NE 5G (lisa)
+
+            **Build Info:**
+            - Kernel: `${{ github.event.inputs.KERNEL_SOURCE }}` @ `${{ github.event.inputs.KERNEL_BRANCH }}`
+            - SukiSU: `${{ github.event.inputs.SUKISU_BRANCH }}`
+            - Hook: **Manual Hook** (NOT kprobe)
+            - KPM: `${{ github.event.inputs.ENABLE_KPM }}`
+            - Touchscreen Fix: `${{ github.event.inputs.FIX_TOUCHSCREEN }}`
+
+            **Patched kernel files:**
+            - `fs/exec.c` · `fs/open.c` · `fs/read_write.c` · `fs/stat.c`
+            - `drivers/input/input.c` · `fs/devpts/inode.c`
+
+            **Flash:**
+            ```
+            fastboot flash boot boot_sukisu.img
+            fastboot reboot
+            ```
+
+            > ⚠️ Always backup stock boot.img before flashing!
+          files: |
+            release_artifacts/boot_sukisu.img
+            release_artifacts/BUILD_INFO.txt
+            release_artifacts/kernel_modules.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
