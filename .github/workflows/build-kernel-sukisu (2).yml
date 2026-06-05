@@ -413,7 +413,7 @@ jobs:
           dump_boot;
 
           write_boot;
-ANYKERNEL_EOF
+          ANYKERNEL_EOF
           # Remove leading whitespace from heredoc
           sed -i 's/^          //' anykernel.sh
 
