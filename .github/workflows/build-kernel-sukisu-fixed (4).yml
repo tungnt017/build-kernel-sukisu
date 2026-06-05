@@ -1,0 +1,513 @@
+name: Build Kernel with SukiSU-Ultra & Repack boot.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_SOURCE:
+        description: "Kernel source repository URL"
+        required: true
+        default: "https://github.com/PixelExperience-Devices/kernel_xiaomi_lisa"
+      KERNEL_BRANCH:
+        description: "Kernel source branch"
+        required: true
+        default: "thirteen"
+      KERNEL_DEFCONFIG:
+        description: "Defconfig file"
+        required: true
+        default: "lisa_defconfig"
+      SUKISU_BRANCH:
+        description: "SukiSU-Ultra branch"
+        required: true
+        default: "main"
+      ENABLE_KPM:
+        description: "Enable KPM (Kernel Patch Module)"
+        required: false
+        default: true
+        type: boolean
+      DISABLE_LTO:
+        description: "Disable LTO"
+        required: false
+        default: false
+        type: boolean
+      STOCK_BOOT_URL:
+        description: "Stock boot.img URL for repacking"
+        required: true
+        default: "https://github.com/tungnt017/build-kernel-sukisu/releases/download/2.0/boot.img"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Kernel & Repack boot.img
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      # ============================================================
+      # 1. Checkout repository
+      # ============================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # 2. Install build dependencies
+      # ============================================================
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl \
+            flex git kmod libelf-dev libssl-dev lld llvm \
+            make python3 unzip wget zip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      # ============================================================
+      # 3. Setup Clang toolchain
+      # ============================================================
+      - name: Setup Clang toolchain
+        run: |
+          mkdir -p toolchain/clang
+          echo "========== Downloading Clang toolchain =========="
+
+          # Option 1: ZyCromerZ Clang (actively maintained, GitHub releases)
+          CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/20.0.0git-20241028-release/Clang-20.0.0git-20241028.tar.gz"
+          if wget -q --spider "$CLANG_URL" 2>/dev/null; then
+            echo "Downloading ZyCromerZ Clang..."
+            wget -q -O clang.tar.gz "$CLANG_URL"
+            tar -xf clang.tar.gz -C toolchain/clang --strip-components=1
+            rm clang.tar.gz
+          else
+            echo "ZyCromerZ Clang not available, trying alternative..."
+            # Option 2: Gonon Clang
+            GONON_URL="https://github.com/Gonon-Kernel/gonon-clang/archive/refs/heads/main.tar.gz"
+            if wget -q --spider "$GONON_URL" 2>/dev/null; then
+              echo "Downloading Gonon Clang..."
+              wget -q -O clang.tar.gz "$GONON_URL"
+              tar -xf clang.tar.gz -C toolchain/clang --strip-components=1
+              rm clang.tar.gz
+            else
+              echo "No external clang available, using system clang"
+              echo "USE_SYSTEM_CLANG=true" >> $GITHUB_ENV
+            fi
+          fi
+
+          # Verify
+          if [ -f "toolchain/clang/bin/clang" ]; then
+            echo "Clang version:"
+            toolchain/clang/bin/clang --version
+            echo "Clang toolchain ready"
+          else
+            echo "WARNING: External clang not found, will use system clang"
+            echo "USE_SYSTEM_CLANG=true" >> $GITHUB_ENV
+            clang --version || echo "System clang also not found!"
+          fi
+
+      # ============================================================
+      # 4. Clone kernel source
+      # ============================================================
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 \
+            -b ${{ github.event.inputs.KERNEL_BRANCH }} \
+            ${{ github.event.inputs.KERNEL_SOURCE }} \
+            kernel_source
+          echo "Kernel source cloned"
+          head -5 kernel_source/Makefile
+
+      # ============================================================
+      # 5. Integrate SukiSU-Ultra (add source tree)
+      # ============================================================
+      - name: Integrate SukiSU-Ultra
+        run: |
+          cd kernel_source
+          echo "========== Integrating SukiSU-Ultra (${{ github.event.inputs.SUKISU_BRANCH }}) =========="
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            | bash -s ${{ github.event.inputs.SUKISU_BRANCH }}
+          echo "SukiSU-Ultra source tree integrated"
+          ls -la KernelSU/ 2>/dev/null || ls -la drivers/kernelsu/ 2>/dev/null || echo "Check KernelSU directory"
+
+      # ============================================================
+      # 6. Apply manual hook patches (NOT kprobe)
+      # ============================================================
+      - name: Apply manual hook patches
+        run: |
+          cd kernel_source
+          echo "========== Applying manual hook patches for non-GKI kernel =========="
+
+          # Find defconfig path
+          DEFCONFIG="arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}"
+          if [ ! -f "$DEFCONFIG" ]; then
+            DEFCONFIG="arch/arm64/configs/vendor/${{ github.event.inputs.KERNEL_DEFCONFIG }}"
+          fi
+          echo "Using defconfig: $DEFCONFIG"
+
+          # Add KSU + manual hook configs to defconfig
+          echo "" >> "$DEFCONFIG"
+          echo "# KernelSU (SukiSU-Ultra) manual hook" >> "$DEFCONFIG"
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU=y and CONFIG_KSU_MANUAL_HOOK=y added to defconfig"
+
+          # ===================== PATCH 1: fs/exec.c =====================
+          echo "--- Patching fs/exec.c ---"
+          cat > /tmp/exec_patch.txt << 'PATCH_EOF'
+          #ifdef CONFIG_KSU
+          extern bool ksu_execveat_hook __read_mostly;
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+          			void *envp, int *flags);
+          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+          				 void *argv, void *envp, int *flags);
+          #endif
+          PATCH_EOF
+          sed -i '/^static int do_execveat_common/r /tmp/exec_patch.txt' fs/exec.c
+
+          cat > /tmp/exec_hook.txt << 'HOOK_EOF'
+          #ifdef CONFIG_KSU
+          	if (unlikely(ksu_execveat_hook))
+          		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+          	else
+          		ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+          #endif
+          HOOK_EOF
+          sed -i '/do_execveat_common/,/struct linux_binprm/{/struct linux_binprm/r /tmp/exec_hook.txt
+          }' fs/exec.c
+          grep -c "ksu_handle_execveat" fs/exec.c && echo "fs/exec.c patched" || echo "fs/exec.c patch FAILED"
+
+          # ===================== PATCH 2: fs/open.c =====================
+          echo "--- Patching fs/open.c ---"
+          cat > /tmp/open_extern.txt << 'PATCH_EOF'
+          #ifdef CONFIG_KSU
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+          			        int *flags);
+          #endif
+          PATCH_EOF
+
+          cat > /tmp/open_hook.txt << 'HOOK_EOF'
+          #ifdef CONFIG_KSU
+          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+          HOOK_EOF
+
+          if grep -q "^long do_faccessat\|^int do_faccessat\|^static long do_faccessat" fs/open.c; then
+            sed -i '/^long do_faccessat\|^int do_faccessat\|^static long do_faccessat/r /tmp/open_extern.txt' fs/open.c
+            sed -i '/do_faccessat/,/LOOKUP_FOLLOW/{/LOOKUP_FOLLOW/r /tmp/open_hook.txt
+            }' fs/open.c
+          else
+            sed -i '/SYSCALL_DEFINE3(faccessat/r /tmp/open_extern.txt' fs/open.c
+            sed -i '/SYSCALL_DEFINE3(faccessat/,/LOOKUP_FOLLOW/{/LOOKUP_FOLLOW/r /tmp/open_hook.txt
+            }' fs/open.c
+          fi
+          grep -c "ksu_handle_faccessat" fs/open.c && echo "fs/open.c patched" || echo "fs/open.c patch FAILED"
+
+          # ===================== PATCH 3: fs/read_write.c =====================
+          echo "--- Patching fs/read_write.c ---"
+          cat > /tmp/rw_extern.txt << 'PATCH_EOF'
+          #ifdef CONFIG_KSU
+          extern bool ksu_vfs_read_hook __read_mostly;
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
+          			size_t *count_ptr, loff_t **pos);
+          #endif
+          PATCH_EOF
+
+          cat > /tmp/rw_hook.txt << 'HOOK_EOF'
+          #ifdef CONFIG_KSU
+          	if (unlikely(ksu_vfs_read_hook))
+          		ksu_handle_vfs_read(&file, &buf, &count, &pos);
+          #endif
+          HOOK_EOF
+
+          sed -i '/^ssize_t vfs_read/r /tmp/rw_extern.txt' fs/read_write.c
+          sed -i '/^ssize_t vfs_read/,/if (!(file->f_mode/{/if (!(file->f_mode/r /tmp/rw_hook.txt
+          }' fs/read_write.c
+          grep -c "ksu_handle_vfs_read" fs/read_write.c && echo "fs/read_write.c patched" || echo "fs/read_write.c patch FAILED"
+
+          # ===================== PATCH 4: fs/stat.c =====================
+          echo "--- Patching fs/stat.c ---"
+          cat > /tmp/stat_extern.txt << 'PATCH_EOF'
+          #ifdef CONFIG_KSU
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+          #endif
+          PATCH_EOF
+
+          cat > /tmp/stat_hook.txt << 'HOOK_EOF'
+          #ifdef CONFIG_KSU
+          	ksu_handle_stat(&dfd, &filename, &flags);
+          #endif
+          HOOK_EOF
+
+          if grep -q "^int vfs_statx" fs/stat.c; then
+            sed -i '/^int vfs_statx/r /tmp/stat_extern.txt' fs/stat.c
+            sed -i '/^int vfs_statx/,/struct path path/{/struct path path/r /tmp/stat_hook.txt
+            }' fs/stat.c
+          elif grep -q "^int vfs_fstatat" fs/stat.c; then
+            sed -i '/^int vfs_fstatat/r /tmp/stat_extern.txt' fs/stat.c
+            sed -i '/^int vfs_fstatat/,/int error/{/int error/r /tmp/stat_hook.txt
+            }' fs/stat.c
+          fi
+          grep -c "ksu_handle_stat" fs/stat.c && echo "fs/stat.c patched" || echo "fs/stat.c patch FAILED"
+
+          # ===================== PATCH 5: drivers/input/input.c =====================
+          echo "--- Patching drivers/input/input.c ---"
+          cat > /tmp/input_extern.txt << 'PATCH_EOF'
+          #ifdef CONFIG_KSU
+          extern bool ksu_input_hook __read_mostly;
+          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
+          #endif
+          PATCH_EOF
+
+          cat > /tmp/input_hook.txt << 'HOOK_EOF'
+          #ifdef CONFIG_KSU
+          	if (unlikely(ksu_input_hook))
+          		ksu_handle_input_handle_event(&type, &code, &value);
+          #endif
+          HOOK_EOF
+
+          sed -i '/^static void input_handle_event/r /tmp/input_extern.txt' drivers/input/input.c
+          sed -i '/^static void input_handle_event/,/int disposition = input_get_disposition/{/int disposition = input_get_disposition/r /tmp/input_hook.txt
+          }' drivers/input/input.c
+          grep -c "ksu_handle_input_handle_event" drivers/input/input.c && echo "drivers/input/input.c patched" || echo "drivers/input/input.c patch FAILED"
+
+          # ===================== PATCH 6: fs/devpts/inode.c =====================
+          echo "--- Patching fs/devpts/inode.c ---"
+          if [ -f "fs/devpts/inode.c" ]; then
+            cat > /tmp/devpts_extern.txt << 'PATCH_EOF'
+          #ifdef CONFIG_KSU
+          extern int ksu_handle_devpts(struct inode*);
+          #endif
+          PATCH_EOF
+
+            cat > /tmp/devpts_hook.txt << 'HOOK_EOF'
+          #ifdef CONFIG_KSU
+          	ksu_handle_devpts(dentry->d_inode);
+          #endif
+          HOOK_EOF
+
+            sed -i '/^void \*devpts_get_priv/r /tmp/devpts_extern.txt' fs/devpts/inode.c
+            sed -i '/^void \*devpts_get_priv/,/DEVPTS_SUPER_MAGIC/{/DEVPTS_SUPER_MAGIC/r /tmp/devpts_hook.txt
+            }' fs/devpts/inode.c
+            grep -c "ksu_handle_devpts" fs/devpts/inode.c && echo "fs/devpts/inode.c patched" || echo "fs/devpts/inode.c patch FAILED"
+          else
+            echo "fs/devpts/inode.c not found, skipping"
+          fi
+
+          echo ""
+          echo "========== Manual hook patches complete =========="
+
+      # ============================================================
+      # 7. Fix touchscreen: change touch drivers from =m to =y
+      # ============================================================
+      - name: Fix touchscreen drivers (module to built-in)
+        run: |
+          cd kernel_source
+          echo "========== Fixing touchscreen drivers =========="
+
+          DEFCONFIG="arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}"
+          if [ ! -f "$DEFCONFIG" ]; then
+            DEFCONFIG="arch/arm64/configs/vendor/${{ github.event.inputs.KERNEL_DEFCONFIG }}"
+          fi
+          echo "Defconfig: $DEFCONFIG"
+
+          echo ""
+          echo "--- BEFORE: Touchscreen configs in defconfig ---"
+          grep -i "touch\|fts\|focaltech\|goodix\|novatek\|nt36\|synaptics\|gt9" "$DEFCONFIG" || echo "(none found)"
+
+          echo ""
+          echo "--- Changing touchscreen drivers from =m to =y ---"
+
+          # Broad sweep: change any touch-related config from =m to =y
+          sed -i '/[Tt][Oo][Uu][Cc][Hh]/s/=m$/=y/' "$DEFCONFIG"
+          sed -i '/FOCALTECH/s/=m$/=y/' "$DEFCONFIG"
+          sed -i '/FTS/s/=m$/=y/' "$DEFCONFIG"
+          sed -i '/GOODIX/s/=m$/=y/' "$DEFCONFIG"
+          sed -i '/NOVATEK/s/=m$/=y/' "$DEFCONFIG"
+          sed -i '/NT36/s/=m$/=y/' "$DEFCONFIG"
+          sed -i '/SYNAPTICS/s/=m$/=y/' "$DEFCONFIG"
+          sed -i '/GT9/s/=m$/=y/' "$DEFCONFIG"
+
+          echo ""
+          echo "--- AFTER: Touchscreen configs in defconfig ---"
+          grep -i "touch\|fts\|focaltech\|goodix\|novatek\|nt36\|synaptics\|gt9" "$DEFCONFIG" || echo "(none found)"
+
+          echo ""
+          echo "--- Touchscreen drivers in kernel source ---"
+          ls drivers/input/touchscreen/ 2>/dev/null | head -30 || echo "Standard path not found"
+          echo ""
+          echo "Touchscreen fix applied"
+
+      # ============================================================
+      # 8. Enable KPM support (if requested)
+      # ============================================================
+      - name: Enable KPM support
+        if: ${{ github.event.inputs.ENABLE_KPM == 'true' }}
+        run: |
+          cd kernel_source
+          DEFCONFIG="arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}"
+          if [ ! -f "$DEFCONFIG" ]; then
+            DEFCONFIG="arch/arm64/configs/vendor/${{ github.event.inputs.KERNEL_DEFCONFIG }}"
+          fi
+          echo "" >> "$DEFCONFIG"
+          echo "# KPM support" >> "$DEFCONFIG"
+          echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+          echo "CONFIG_KALLSYMS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG"
+          echo "KPM configs added to defconfig"
+
+      # ============================================================
+      # 9. Disable LTO (if requested)
+      # ============================================================
+      - name: Disable LTO
+        if: ${{ github.event.inputs.DISABLE_LTO == 'true' }}
+        run: |
+          cd kernel_source
+          DEFCONFIG="arch/arm64/configs/${{ github.event.inputs.KERNEL_DEFCONFIG }}"
+          if [ ! -f "$DEFCONFIG" ]; then
+            DEFCONFIG="arch/arm64/configs/vendor/${{ github.event.inputs.KERNEL_DEFCONFIG }}"
+          fi
+          sed -i 's/CONFIG_LTO=y/# CONFIG_LTO is not set/' "$DEFCONFIG"
+          sed -i 's/CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' "$DEFCONFIG"
+          sed -i 's/CONFIG_THINLTO=y/# CONFIG_THINLTO is not set/' "$DEFCONFIG"
+          echo "" >> "$DEFCONFIG"
+          echo "# CONFIG_LTO is not set" >> "$DEFCONFIG"
+          echo "# CONFIG_LTO_CLANG is not set" >> "$DEFCONFIG"
+          echo "# CONFIG_THINLTO is not set" >> "$DEFCONFIG"
+          echo "LTO disabled in defconfig"
+
+      # ============================================================
+      # 10. Generate defconfig
+      # ============================================================
+      - name: Generate defconfig
+        run: |
+          cd kernel_source
+          export PATH="$(pwd)/../toolchain/clang/bin:$PATH"
+          make O=out ARCH=arm64             CC=clang             CROSS_COMPILE=aarch64-linux-gnu-             CLANG_TRIPLE=aarch64-linux-gnu-             ${{ github.event.inputs.KERNEL_DEFCONFIG }}
+          echo "Defconfig generated"
+
+          echo ""
+          echo "--- KSU config check in .config ---"
+          grep "CONFIG_KSU" out/.config || echo "WARNING: CONFIG_KSU not found in .config"
+
+          echo ""
+          echo "--- Touchscreen config check in .config ---"
+          grep -i "TOUCH\|FTS\|FOCALTECH\|GOODIX\|NOVATEK\|NT36\|SYNAPTICS\|GT9" out/.config | grep -v "^#" || echo "No touch configs enabled"
+
+      # ============================================================
+      # 11. Build kernel (FIXED: no tail -30, added KCFLAGS)
+      # ============================================================
+      - name: Build kernel
+        run: |
+          cd kernel_source
+          echo "========== Building kernel =========="
+          START_TIME=$(date +%s)
+
+          if [ "$USE_SYSTEM_CLANG" != "true" ]; then
+            export PATH="$(pwd)/../toolchain/clang/bin:$PATH"
+          fi
+
+          EXTRA_KCFLAGS="-Wno-error=enum-conversion"
+          EXTRA_KCFLAGS="$EXTRA_KCFLAGS -Wno-error=enum-compare"
+          EXTRA_KCFLAGS="$EXTRA_KCFLAGS -Wno-error=single-bit-bitfield-constant-conversion"
+          EXTRA_KCFLAGS="$EXTRA_KCFLAGS -Wno-error=unused-variable"
+          EXTRA_KCFLAGS="$EXTRA_KCFLAGS -Wno-error=sometimes-uninitialized"
+          EXTRA_KCFLAGS="$EXTRA_KCFLAGS -Wno-error=format"
+          EXTRA_KCFLAGS="$EXTRA_KCFLAGS -Wno-error=incompatible-pointer-types"
+
+          make -j$(nproc) O=out ARCH=arm64             CROSS_COMPILE=aarch64-linux-gnu-             CC=clang             CLANG_TRIPLE=aarch64-linux-gnu-             KCFLAGS="$EXTRA_KCFLAGS"             Image 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+
+          END_TIME=$(date +%s)
+          ELAPSED=$(( END_TIME - START_TIME ))
+          echo ""
+          echo "========== Kernel build completed in ${ELAPSED}s =========="
+
+          if [ -f out/arch/arm64/boot/Image ]; then
+            echo "Kernel Image built successfully!"
+            ls -lh out/arch/arm64/boot/Image
+          else
+            echo "ERROR: Kernel Image not found!"
+            echo ""
+            echo "========== COMPILER ERRORS (first 50) =========="
+            grep -i "error:" build.log | head -50 || true
+            echo ""
+            echo "========== LAST 50 LINES =========="
+            tail -50 build.log || true
+            echo ""
+            ls -la out/arch/arm64/boot/ 2>/dev/null || true
+            exit 1
+          fi
+
+      # ============================================================
+      # 12. Download stock boot.img
+      # ============================================================
+      - name: Download stock boot.img
+        run: |
+          mkdir -p workdir
+          wget -q -O workdir/stock_boot.img "${{ github.event.inputs.STOCK_BOOT_URL }}"
+          ls -lh workdir/stock_boot.img
+          echo "Stock boot.img downloaded"
+
+      # ============================================================
+      # 13. Extract magiskboot from official Magisk APK
+      # ============================================================
+      - name: Setup magiskboot
+        run: |
+          cd workdir
+          MAGISK_URL="https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk"
+          wget -q -O Magisk.apk "$MAGISK_URL"
+          unzip -o Magisk.apk lib/x86_64/libmagiskboot.so -d . ||           unzip -o Magisk.apk lib/x86/libmagiskboot.so -d .
+          MAGISKBOOT=$(find . -name "libmagiskboot.so" | head -1)
+          cp "$MAGISKBOOT" ./magiskboot
+          chmod +x ./magiskboot
+          ./magiskboot 2>&1 | head -3 || true
+          echo "magiskboot ready"
+
+      # ============================================================
+      # 14. Repack boot.img with new kernel
+      # ============================================================
+      - name: Repack boot.img
+        run: |
+          cd workdir
+
+          echo "========== Unpacking stock boot.img =========="
+          ./magiskboot unpack -h stock_boot.img
+          ls -la
+
+          echo "========== Replacing kernel =========="
+          cp ../kernel_source/out/arch/arm64/boot/Image kernel
+          ls -lh kernel
+
+          echo "========== Repacking boot.img =========="
+          ./magiskboot repack stock_boot.img new_boot.img
+          ls -lh new_boot.img
+          echo "boot.img repacked successfully!"
+
+      # ============================================================
+      # 15. Upload artifacts
+      # ============================================================
+      - name: Upload boot.img artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-sukisu-${{ github.run_number }}
+          path: workdir/new_boot.img
+
+      # ============================================================
+      # 16. Create GitHub Release
+      # ============================================================
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: "SukiSU Kernel Build #${{ github.run_number }}"
+          body: |
+            ## SukiSU-Ultra Kernel Build (Manual Hook + Touch Fix)
+            - **Kernel Source**: ${{ github.event.inputs.KERNEL_SOURCE }}
+            - **Branch**: ${{ github.event.inputs.KERNEL_BRANCH }}
+            - **Defconfig**: ${{ github.event.inputs.KERNEL_DEFCONFIG }}
+            - **SukiSU Branch**: ${{ github.event.inputs.SUKISU_BRANCH }}
+            - **Hook Method**: Manual Hook (CONFIG_KSU_MANUAL_HOOK=y)
+            - **KPM Enabled**: ${{ github.event.inputs.ENABLE_KPM }}
+            - **LTO Disabled**: ${{ github.event.inputs.DISABLE_LTO }}
+            - **Touchscreen Fix**: Touch drivers built-in (=m to =y)
+          files: workdir/new_boot.img
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
