@@ -479,37 +479,42 @@ jobs:
       ########################################################################
       # 10. Build kernel Image
       ########################################################################
-      - name: Build kernel Image
-        working-directory: kernel_source
+      - name: Build kernel
         run: |
           echo "========== Building kernel =========="
           START_TIME=$(date +%s)
-
+          
+          cd kernel_source
+          
           if [ "$USE_SYSTEM_CLANG" = "true" ]; then
             make -j$(nproc) O=out ARCH=arm64 \
               CROSS_COMPILE=aarch64-linux-gnu- \
               CC=clang \
               CLANG_TRIPLE=aarch64-linux-gnu- \
-              Image 2>&1 | tail -30
+              Image 2>&1 | tee build.log; BUILD_EXIT=${PIPESTATUS[0]}
           else
             export PATH="$(pwd)/../toolchain/clang/bin:$PATH"
             make -j$(nproc) O=out ARCH=arm64 \
               CROSS_COMPILE=aarch64-linux-gnu- \
               CC=clang \
               CLANG_TRIPLE=aarch64-linux-gnu- \
-              Image 2>&1 | tail -30
+              Image 2>&1 | tee build.log; BUILD_EXIT=${PIPESTATUS[0]}
           fi
-
+          
           END_TIME=$(date +%s)
           ELAPSED=$(( END_TIME - START_TIME ))
           echo ""
           echo "========== Kernel build completed in ${ELAPSED}s =========="
-
+          
           if [ -f out/arch/arm64/boot/Image ]; then
             echo "✅ Kernel Image built successfully!"
             ls -lh out/arch/arm64/boot/Image
           else
             echo "❌ ERROR: Kernel Image not found!"
+            echo ""
+            echo "========== COMPILER ERRORS =========="
+            grep -i "error:" build.log | head -50
+            echo ""
             ls -la out/arch/arm64/boot/ || true
             exit 1
           fi
