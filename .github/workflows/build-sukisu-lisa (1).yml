@@ -1,0 +1,538 @@
+name: Build SukiSU Ultra Kernel for Xiaomi Lisa (Manual Hook)
+
+on:
+  workflow_dispatch:
+    inputs:
+      SUKISU_BRANCH:
+        description: 'SukiSU-Ultra branch (builtin / main / susfs-main)'
+        required: false
+        default: 'builtin'
+      ENABLE_KPM:
+        description: 'Enable KPM support (true/false)'
+        required: false
+        default: 'false'
+
+jobs:
+  build-kernel:
+    name: Build Kernel - SukiSU Ultra Manual Hook (non-GKI)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    env:
+      KERNEL_REPO: https://github.com/PixelExperience-Devices/kernel_xiaomi_lisa
+      KERNEL_BRANCH: thirteen
+      DEVICE: lisa
+      DEFCONFIG: lisa_defconfig
+      ARCH: arm64
+      STOCK_BOOT_URL: https://github.com/tungnt017/build-kernel-sukisu/releases/download/2.0/boot.img
+      ANYKERNEL3_REPO: https://github.com/osm0sis/AnyKernel3
+
+    steps:
+      # ═══════════════════════════════════════════════════════════
+      # 1. Checkout workflow repo
+      # ═══════════════════════════════════════════════════════════
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      # ═══════════════════════════════════════════════════════════
+      # 2. Install build dependencies
+      # ═══════════════════════════════════════════════════════════
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            git curl wget zip unzip python3 python-is-python3 \
+            libncurses-dev lz4 zstd cpio
+
+      # ═══════════════════════════════════════════════════════════
+      # 3. Free up disk space
+      # ═══════════════════════════════════════════════════════════
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
+      # ═══════════════════════════════════════════════════════════
+      # 4. Clone kernel source
+      # ═══════════════════════════════════════════════════════════
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b ${{ env.KERNEL_BRANCH }} \
+            ${{ env.KERNEL_REPO }} kernel_source
+          cd kernel_source
+          echo "KERNEL_DIR=$(pwd)" >> $GITHUB_ENV
+
+      # ═══════════════════════════════════════════════════════════
+      # 5. Setup Proton Clang toolchain
+      # ═══════════════════════════════════════════════════════════
+      - name: Setup Proton Clang toolchain
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang ~/toolchains/proton-clang
+          echo "CLANG_DIR=$HOME/toolchains/proton-clang" >> $GITHUB_ENV
+
+      # ═══════════════════════════════════════════════════════════
+      # 6. Integrate SukiSU-Ultra into kernel source
+      # ═══════════════════════════════════════════════════════════
+      - name: Integrate SukiSU-Ultra
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          BRANCH=${{ github.event.inputs.SUKISU_BRANCH || 'builtin' }}
+          echo "Integrating SukiSU-Ultra branch: $BRANCH"
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "$BRANCH"
+          echo "SukiSU-Ultra integration complete."
+
+      # ═══════════════════════════════════════════════════════════
+      # 7. Patch defconfig for Manual Hook (lisa_defconfig)
+      # ═══════════════════════════════════════════════════════════
+      - name: Patch defconfig for SukiSU Manual Hook
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+
+          DEFCONFIG_PATH="arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG }}"
+          echo "Patching defconfig: $DEFCONFIG_PATH"
+
+          # Remove any existing kprobe-based KSU config
+          sed -i '/CONFIG_KSU_MANUAL_HOOK is not set/d' "$DEFCONFIG_PATH"
+          sed -i '/CONFIG_KSU_HOOK_KPROBES/d' "$DEFCONFIG_PATH"
+
+          # Append SukiSU Manual Hook configs
+          echo "" >> "$DEFCONFIG_PATH"
+          echo "# ==============================" >> "$DEFCONFIG_PATH"
+          echo "# SukiSU-Ultra Manual Hook" >> "$DEFCONFIG_PATH"
+          echo "# ==============================" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KALLSYMS=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG_PATH"
+
+          # Enable KPM if requested
+          if [ "${{ github.event.inputs.ENABLE_KPM }}" = "true" ]; then
+            echo "CONFIG_KPM=y" >> "$DEFCONFIG_PATH"
+            echo "KPM support enabled."
+          fi
+
+          echo "=== Patched defconfig (KSU entries) ==="
+          grep -E "CONFIG_KSU|CONFIG_KALLSYMS|CONFIG_KPM" "$DEFCONFIG_PATH" || true
+
+      # ═══════════════════════════════════════════════════════════
+      # 8. Apply SukiSU Manual Hook Patches to kernel source
+      #    Reference: SukiSU-Ultra/SukiSU_patch/hooks/syscall_hooks.patch
+      #    Patches: fs/exec.c, fs/open.c, fs/read_write.c, fs/stat.c,
+      #             drivers/input/input.c, drivers/tty/pty.c, kernel/reboot.c
+      # ═══════════════════════════════════════════════════════════
+      - name: Apply SukiSU Manual Hook Patches
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+
+          echo "============================================"
+          echo "Applying SukiSU Manual Hook Patches"
+          echo "Hook method: Manual (NOT kprobe)"
+          echo "Source: SukiSU-Ultra/SukiSU_patch/hooks/syscall_hooks.patch"
+          echo "============================================"
+
+          # ── 8a. Patch fs/exec.c ──────────────────────────────
+          echo "[1/7] Patching fs/exec.c ..."
+
+          # Inject extern declarations before do_execve
+          sed -i '/^static int do_execve(struct filename \*filename,$/i \
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          extern bool ksu_execveat_hook __read_mostly;\
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\
+          \t\t\t      void *envp, int *flags);\
+          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\
+          \t\t\t\t\tvoid *argv, void *envp, int *flags);\
+          #endif\
+          ' fs/exec.c
+
+          # Inject hook call inside do_execve (after envp line)
+          sed -i '/struct user_arg_ptr envp = { \.ptr\.native = __envp };/{
+          a\
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          \tif (unlikely(ksu_execveat_hook))\
+          \t\tksu_handle_execveat((int *)AT_FDCWD, \&filename, \&argv, \&envp, 0);\
+          \telse\
+          \t\tksu_handle_execveat_sucompat((int *)AT_FDCWD, \&filename, NULL, NULL, NULL);\
+          #endif
+          }' fs/exec.c
+
+          # Inject hook in compat_do_execve for 32-bit su
+          sed -i '/\.is_compat = true,/{
+          N
+          /\.ptr\.compat = __envp,/{
+          a\
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          \tif (!ksu_execveat_hook)\
+          \t\tksu_handle_execveat_sucompat((int *)AT_FDCWD, \&filename, NULL, NULL, NULL);\
+          #endif
+          }
+          }' fs/exec.c
+
+          echo "  ✅ fs/exec.c patched"
+
+          # ── 8b. Patch fs/open.c ──────────────────────────────
+          echo "[2/7] Patching fs/open.c ..."
+
+          # Inject extern declaration before SYSCALL_DEFINE3(faccessat,...)
+          sed -i '/^SYSCALL_DEFINE3(faccessat, int, dfd, const char __user \*, filename, int, mode)$/i \
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,\
+          \t\t\t       int *flags);\
+          #endif\
+          ' fs/open.c
+
+          # Inject hook call inside faccessat (after opening brace)
+          sed -i '/^SYSCALL_DEFINE3(faccessat, int, dfd, const char __user \*, filename, int, mode)$/{
+          n
+          /^{$/a\
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          \tksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);\
+          #endif
+          }' fs/open.c
+
+          echo "  ✅ fs/open.c patched"
+
+          # ── 8c. Patch fs/read_write.c ────────────────────────
+          echo "[3/7] Patching fs/read_write.c ..."
+
+          # Inject extern declaration before SYSCALL_DEFINE3(read,...)
+          sed -i '/^SYSCALL_DEFINE3(read, unsigned int, fd, char __user \*, buf, size_t, count)$/i \
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          extern bool ksu_vfs_read_hook __read_mostly;\
+          extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr,\
+          \t\t\t      size_t *count_ptr);\
+          #endif\
+          ' fs/read_write.c
+
+          # Inject hook call inside read syscall (after opening brace)
+          sed -i '/^SYSCALL_DEFINE3(read, unsigned int, fd, char __user \*, buf, size_t, count)$/{
+          n
+          /^{$/a\
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          \tif (unlikely(ksu_vfs_read_hook))\
+          \t\tksu_handle_sys_read(fd, \&buf, \&count);\
+          #endif
+          }' fs/read_write.c
+
+          echo "  ✅ fs/read_write.c patched"
+
+          # ── 8d. Patch fs/stat.c ──────────────────────────────
+          echo "[4/7] Patching fs/stat.c ..."
+
+          # Inject extern declaration before newfstatat
+          sed -i '/#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)/i \
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\
+          #endif\
+          ' fs/stat.c
+
+          # Inject hook inside SYSCALL_DEFINE4(newfstatat,...) after "int error;"
+          sed -i '/SYSCALL_DEFINE4(newfstatat,/{
+          :loop
+          n
+          /int error;/{
+          a\
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          \tksu_handle_stat(\&dfd, \&filename, \&flag);\
+          #endif
+          b
+          }
+          b loop
+          }' fs/stat.c
+
+          # Inject hook inside compat fstatat64 for 32-bit su
+          sed -i '/SYSCALL_DEFINE4(fstatat64,\|COMPAT_SYSCALL_DEFINE4(fstatat64,/{
+          :loop2
+          n
+          /int error;/{
+          a\
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_COMPAT) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          \tksu_handle_stat(\&dfd, \&filename, \&flag); /* 32-bit su */\
+          #endif
+          b
+          }
+          b loop2
+          }' fs/stat.c
+
+          echo "  ✅ fs/stat.c patched"
+
+          # ── 8e. Patch drivers/input/input.c ──────────────────
+          echo "[5/7] Patching drivers/input/input.c ..."
+
+          # Inject extern declaration before input_event function
+          sed -i '/^void input_event(struct input_dev \*dev,$/i \
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          extern bool ksu_input_hook __read_mostly;\
+          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\
+          #endif\
+          ' drivers/input/input.c
+
+          # Inject hook call inside input_event (after "unsigned long flags;")
+          sed -i '/^void input_event(struct input_dev \*dev,/{
+          :loop3
+          n
+          /unsigned long flags;/{
+          a\
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          \tif (unlikely(ksu_input_hook))\
+          \t\tksu_handle_input_handle_event(\&type, \&code, \&value);\
+          #endif
+          b
+          }
+          b loop3
+          }' drivers/input/input.c
+
+          echo "  ✅ drivers/input/input.c patched"
+
+          # ── 8f. Patch drivers/tty/pty.c ──────────────────────
+          echo "[6/7] Patching drivers/tty/pty.c ..."
+
+          # Inject extern declaration before pts_unix98_lookup
+          sed -i '/^static struct tty_struct \*pts_unix98_lookup(struct tty_driver \*driver,$/i \
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          extern int ksu_handle_devpts(struct inode*);\
+          #endif\
+          ' drivers/tty/pty.c
+
+          # Inject hook call inside pts_unix98_lookup (after "struct tty_struct *tty;")
+          sed -i '/^static struct tty_struct \*pts_unix98_lookup(struct tty_driver \*driver,/{
+          :loop4
+          n
+          /struct tty_struct \*tty;/{
+          a\
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          \tksu_handle_devpts((struct inode *)file->f_path.dentry->d_inode);\
+          #endif
+          b
+          }
+          b loop4
+          }' drivers/tty/pty.c
+
+          echo "  ✅ drivers/tty/pty.c patched"
+
+          # ── 8g. Patch kernel/reboot.c ────────────────────────
+          echo "[7/7] Patching kernel/reboot.c ..."
+
+          # Inject extern declaration before SYSCALL_DEFINE4(reboot,...)
+          sed -i '/^SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,$/i \
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\
+          #endif\
+          ' kernel/reboot.c
+
+          # Inject hook call inside reboot syscall (after "int ret = 0;")
+          sed -i '/^SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,/{
+          :loop5
+          n
+          /int ret = 0;/{
+          a\
+          #if defined(CONFIG_KSU) \&\& defined(CONFIG_KSU_MANUAL_HOOK)\
+          \tksu_handle_sys_reboot(magic1, magic2, cmd, \&arg);\
+          #endif
+          b
+          }
+          b loop5
+          }' kernel/reboot.c
+
+          echo "  ✅ kernel/reboot.c patched"
+
+          echo ""
+          echo "============================================"
+          echo "All 7 manual hook patches applied!"
+          echo "  1. fs/exec.c       - execveat hooks"
+          echo "  2. fs/open.c       - faccessat hook"
+          echo "  3. fs/read_write.c - sys_read hook"
+          echo "  4. fs/stat.c       - stat hooks"
+          echo "  5. drivers/input/input.c - input_event hook"
+          echo "  6. drivers/tty/pty.c     - devpts hook"
+          echo "  7. kernel/reboot.c       - reboot hook"
+          echo "============================================"
+
+      # ═══════════════════════════════════════════════════════════
+      # 9. Build the kernel
+      # ═══════════════════════════════════════════════════════════
+      - name: Build kernel
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+
+          export PATH="${{ env.CLANG_DIR }}/bin:$PATH"
+
+          MAKE_ARGS="
+            O=out
+            ARCH=${{ env.ARCH }}
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+          "
+
+          # Generate defconfig
+          echo "Generating defconfig: ${{ env.DEFCONFIG }}"
+          make ${MAKE_ARGS} ${{ env.DEFCONFIG }}
+
+          # Verify KSU manual hook is enabled
+          echo "=== Verifying KSU config ==="
+          grep -E "CONFIG_KSU" out/.config || true
+
+          # Build kernel Image
+          echo "Building kernel with $(nproc --all) threads..."
+          make -j$(nproc --all) ${MAKE_ARGS} 2>&1 | tee build.log
+
+          # Verify output
+          if [ -f out/arch/${{ env.ARCH }}/boot/Image ]; then
+            echo "✅ Kernel Image built successfully!"
+            echo "KERNEL_IMAGE=${{ env.KERNEL_DIR }}/out/arch/${{ env.ARCH }}/boot/Image" >> $GITHUB_ENV
+          elif [ -f out/arch/${{ env.ARCH }}/boot/Image.gz ]; then
+            echo "✅ Kernel Image.gz built successfully!"
+            echo "KERNEL_IMAGE=${{ env.KERNEL_DIR }}/out/arch/${{ env.ARCH }}/boot/Image.gz" >> $GITHUB_ENV
+          elif [ -f out/arch/${{ env.ARCH }}/boot/Image.gz-dtb ]; then
+            echo "✅ Kernel Image.gz-dtb built successfully!"
+            echo "KERNEL_IMAGE=${{ env.KERNEL_DIR }}/out/arch/${{ env.ARCH }}/boot/Image.gz-dtb" >> $GITHUB_ENV
+          else
+            echo "❌ Kernel build failed! No Image found."
+            echo "=== Last 100 lines of build log ==="
+            tail -100 build.log
+            exit 1
+          fi
+
+      # ═══════════════════════════════════════════════════════════
+      # 10. Download stock boot.img
+      # ═══════════════════════════════════════════════════════════
+      - name: Download stock boot.img
+        run: |
+          mkdir -p ~/boot_work
+          cd ~/boot_work
+          wget -q "${{ env.STOCK_BOOT_URL }}" -O boot.img
+          echo "Stock boot.img downloaded: $(ls -lh boot.img)"
+
+      # ═══════════════════════════════════════════════════════════
+      # 11. Unpack stock boot, replace kernel, repack
+      # ═══════════════════════════════════════════════════════════
+      - name: Repack boot.img with SukiSU kernel
+        run: |
+          cd ~/boot_work
+
+          # Download magiskboot binary
+          wget -q "https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk" -O magisk.apk
+          unzip -jo magisk.apk "lib/x86_64/libmagiskboot.so" -d .
+          mv libmagiskboot.so magiskboot
+          chmod +x magiskboot
+
+          # Unpack
+          ./magiskboot unpack boot.img
+          echo "=== Unpacked boot.img ==="
+          ls -la
+
+          # Replace kernel image
+          cp -f "${{ env.KERNEL_IMAGE }}" kernel
+          echo "Kernel replaced with SukiSU-Ultra patched image."
+
+          # Repack
+          ./magiskboot repack boot.img new-boot.img
+          echo "=== Repacked boot.img ==="
+          ls -lh new-boot.img
+
+          echo "BOOT_OUTPUT=$HOME/boot_work/new-boot.img" >> $GITHUB_ENV
+
+      # ═══════════════════════════════════════════════════════════
+      # 12. Package AnyKernel3 flashable zip
+      # ═══════════════════════════════════════════════════════════
+      - name: Package AnyKernel3
+        run: |
+          cd ~/
+          git clone --depth=1 ${{ env.ANYKERNEL3_REPO }} AnyKernel3
+          cd AnyKernel3
+
+          # Remove unneeded files
+          rm -rf modules patch ramdisk .git .github README.md
+
+          # Write AnyKernel3 config for lisa
+          sed -i "s|kernel.string=.*|kernel.string=SukiSU-Ultra Kernel for Xiaomi Lisa (Manual Hook)|" anykernel.sh
+          sed -i "s|device.name1=.*|device.name1=lisa|" anykernel.sh
+          sed -i "s|device.name2=.*|device.name2=|" anykernel.sh
+          sed -i "s|block=.*|block=/dev/block/bootdevice/by-name/boot|" anykernel.sh
+
+          # Copy kernel image
+          cp "${{ env.KERNEL_IMAGE }}" Image
+
+          # Copy dtb/dtbo if available
+          DTB_PATH="${{ env.KERNEL_DIR }}/out/arch/${{ env.ARCH }}/boot/dtb"
+          DTBO_PATH="${{ env.KERNEL_DIR }}/out/arch/${{ env.ARCH }}/boot/dtbo.img"
+          [ -f "$DTB_PATH" ] && cp "$DTB_PATH" dtb
+          [ -f "$DTBO_PATH" ] && cp "$DTBO_PATH" dtbo.img
+
+          # Create flashable zip
+          DATE=$(date +%Y%m%d)
+          ZIP_NAME="AnyKernel3_SukiSU-Ultra_lisa_ManualHook_${DATE}.zip"
+          zip -r9 "$ZIP_NAME" * -x .git .github README.md
+          echo "AnyKernel3 zip: $(ls -lh $ZIP_NAME)"
+          echo "AK3_ZIP=$HOME/AnyKernel3/$ZIP_NAME" >> $GITHUB_ENV
+
+      # ═══════════════════════════════════════════════════════════
+      # 13. Upload artifacts
+      # ═══════════════════════════════════════════════════════════
+      - name: Upload boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-sukisu-ultra-lisa-manual-hook-${{ github.run_number }}
+          path: ${{ env.BOOT_OUTPUT }}
+          retention-days: 30
+
+      - name: Upload AnyKernel3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-SukiSU-Ultra-lisa-manual-hook-${{ github.run_number }}
+          path: ${{ env.AK3_ZIP }}
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: ${{ env.KERNEL_DIR }}/build.log
+          retention-days: 7
+
+      # ═══════════════════════════════════════════════════════════
+      # 14. Create GitHub Release
+      # ═══════════════════════════════════════════════════════════
+      - name: Create Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sukisu-lisa-v${{ github.run_number }}
+          name: "SukiSU Ultra Kernel - Lisa Build #${{ github.run_number }}"
+          body: |
+            ## SukiSU Ultra Kernel for Xiaomi 11 Lite NE 5G (Lisa)
+
+            **Build Info:**
+            - 🔧 Hook Method: **Manual Hook** (`CONFIG_KSU_MANUAL_HOOK=y`)
+            - 📦 SukiSU Branch: `${{ github.event.inputs.SUKISU_BRANCH || 'builtin' }}`
+            - 🌱 Kernel Source: `PixelExperience-Devices/kernel_xiaomi_lisa` @ `thirteen`
+            - 🔨 KPM: `${{ github.event.inputs.ENABLE_KPM || 'false' }}`
+            - 🚫 Kprobe: **Disabled** (Manual syscall hooks only)
+            - 📋 Defconfig: `lisa_defconfig`
+
+            **Patched Files (Manual Hooks):**
+            1. `fs/exec.c` — execveat + sucompat hooks
+            2. `fs/open.c` — faccessat hook
+            3. `fs/read_write.c` — sys_read hook
+            4. `fs/stat.c` — stat hooks (64-bit + 32-bit compat)
+            5. `drivers/input/input.c` — input_event hook
+            6. `drivers/tty/pty.c` — devpts hook
+            7. `kernel/reboot.c` — reboot hook
+
+            **Flash Instructions:**
+            - **Fastboot**: `fastboot flash boot new-boot.img`
+            - **Recovery**: Flash AnyKernel3 zip via TWRP / OrangeFox
+          files: |
+            ${{ env.BOOT_OUTPUT }}
+            ${{ env.AK3_ZIP }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
