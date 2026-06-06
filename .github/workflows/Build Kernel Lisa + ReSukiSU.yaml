@@ -1,0 +1,308 @@
+name: Build Kernel Lisa + ReSukiSU
+
+on:
+  workflow_dispatch:
+    inputs:
+      resukisu_branch:
+        description: "ReSukiSU branch (main / dev)"
+        required: false
+        default: "main"
+      susfs:
+        description: "Enable SUSFS instead of Manual Hook"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed for release upload
+
+    env:
+      KERNEL_REPO: https://github.com/PixelExperience-Devices/kernel_xiaomi_lisa.git
+      KERNEL_BRANCH: thirteen
+      DEVICE: lisa
+      ARCH: arm64
+      DEFCONFIG: vendor/lahaina-qgki_defconfig
+      # ---------- Toolchain ----------
+      CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r530567.tar.gz
+      GCC_64_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git
+      GCC_32_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git
+      # ---------- AnyKernel3 ----------
+      ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3.git
+
+    steps:
+      # ────────────────────────────────────────────
+      # 1. Setup environment
+      # ────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf \
+            imagemagick lib32readline-dev lib32z1-dev \
+            liblz4-tool libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush rsync \
+            schedtool squashfs-tools xsltproc zip zlib1g-dev \
+            python3 python-is-python3 libelf-dev
+
+      # ────────────────────────────────────────────
+      # 2. Clone Clang toolchain
+      # ────────────────────────────────────────────
+      - name: Clone Clang
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/toolchain/clang
+          # Option A: AOSP Clang (uncomment if preferred)
+          # curl -LSs "$CLANG_URL" | tar -xz -C $GITHUB_WORKSPACE/toolchain/clang
+
+          # Option B: Proton Clang (recommended, includes cross-compile)
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git \
+            $GITHUB_WORKSPACE/toolchain/clang
+
+      - name: Clone GCC toolchains
+        run: |
+          git clone --depth=1 $GCC_64_REPO $GITHUB_WORKSPACE/toolchain/gcc64
+          git clone --depth=1 $GCC_32_REPO $GITHUB_WORKSPACE/toolchain/gcc32
+
+      # ────────────────────────────────────────────
+      # 3. Clone kernel source
+      # ────────────────────────────────────────────
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b $KERNEL_BRANCH $KERNEL_REPO \
+            $GITHUB_WORKSPACE/kernel
+          cd $GITHUB_WORKSPACE/kernel
+          echo "KERNEL_VERSION=$(make kernelversion)" >> $GITHUB_ENV
+
+      # ────────────────────────────────────────────
+      # 4. Integrate ReSukiSU
+      # ────────────────────────────────────────────
+      - name: Add ReSukiSU to kernel tree
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/${{ github.event.inputs.resukisu_branch }}/kernel/setup.sh" | bash -
+          echo "✅ ReSukiSU integrated"
+
+      # ────────────────────────────────────────────
+      # 5. Patch defconfig (KSU + hooks)
+      # ────────────────────────────────────────────
+      - name: Patch defconfig
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          DEFCONFIG_FILE="arch/$ARCH/configs/$DEFCONFIG"
+
+          # Ensure no duplicates
+          sed -i '/CONFIG_KSU/d' "$DEFCONFIG_FILE"
+          sed -i '/CONFIG_KSU_MANUAL_HOOK/d' "$DEFCONFIG_FILE"
+          sed -i '/CONFIG_KSU_SUSFS/d' "$DEFCONFIG_FILE"
+
+          echo "" >> "$DEFCONFIG_FILE"
+          echo "# ReSukiSU" >> "$DEFCONFIG_FILE"
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG_FILE"
+
+          if [ "${{ github.event.inputs.susfs }}" = "true" ]; then
+            echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG_FILE"
+            echo "📦 Mode: SUSFS"
+          else
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG_FILE"
+            echo "🪝 Mode: Manual Hook"
+          fi
+
+          echo "--- Defconfig tail ---"
+          tail -5 "$DEFCONFIG_FILE"
+
+      # ────────────────────────────────────────────
+      # 6. Apply manual hook patches (kernel 5.4)
+      # ────────────────────────────────────────────
+      - name: Apply manual hook patches
+        if: ${{ github.event.inputs.susfs != 'true' }}
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+
+          # ── fs/stat.c ──
+          # Hook vfs_statx (kernel 4.19+)
+          sed -i '/int vfs_statx(int dfd/,/^}/ {
+            /retry:/{
+              a\\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\textern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n\tksu_handle_stat(\&dfd, \&filename, \&flags);\n#endif
+            }
+          }' fs/stat.c
+          echo "✅ Patched fs/stat.c"
+
+          # ── fs/exec.c ──
+          # Hook do_execveat_common (kernel 3.14+)
+          sed -i '/static int do_execveat_common/,/^}/ {
+            /struct filename \*filename;/{
+              a\\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\textern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n\tksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);\n#endif
+            }
+          }' fs/exec.c
+          echo "✅ Patched fs/exec.c"
+
+          # ── fs/open.c ──
+          # Hook do_faccessat (kernel 4.19+)
+          sed -i '/long do_faccessat(int dfd/,/^}/ {
+            /struct path path;/{
+              a\\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\textern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n\tksu_handle_faccessat(\&dfd, \&filename_user, \&mode, \&flags);\n#endif
+            }
+          }' fs/open.c
+          echo "✅ Patched fs/open.c"
+
+          # ── kernel/reboot.c ──
+          # Hook SYSCALL_DEFINE4(reboot) (kernel 3.11+)
+          sed -i '/SYSCALL_DEFINE4(reboot/,/^}/ {
+            /magic2 != .*LINUX_REBOOT_MAGIC2/{
+              i\\n#ifdef CONFIG_KSU_MANUAL_HOOK\n\textern int ksu_handle_sys_reboot(unsigned int *cmd);\n\tksu_handle_sys_reboot(\&cmd);\n#endif
+            }
+          }' kernel/reboot.c
+          echo "✅ Patched kernel/reboot.c"
+
+      # ────────────────────────────────────────────
+      # 7. Build kernel
+      # ────────────────────────────────────────────
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          max-size: 4G
+
+      - name: Build kernel
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+
+          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$GITHUB_WORKSPACE/toolchain/gcc64/bin:$GITHUB_WORKSPACE/toolchain/gcc32/bin:$PATH"
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          export CC="ccache clang"
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+
+          BUILD_ARGS=(
+            ARCH=$ARCH
+            CC="$CC"
+            CROSS_COMPILE=$CROSS_COMPILE
+            CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32
+            CLANG_TRIPLE=$CLANG_TRIPLE
+            O=out
+          )
+
+          # Generate .config from defconfig fragments
+          make "${BUILD_ARGS[@]}" \
+            $DEFCONFIG \
+            vendor/lahaina_QGKI.config \
+            vendor/xiaomi_QGKI.config \
+            vendor/lisa_QGKI.config
+
+          # Build
+          make "${BUILD_ARGS[@]}" -j$(nproc --all) 2>&1 | tee build.log
+
+          # Verify output
+          if [ -f out/arch/$ARCH/boot/Image ]; then
+            echo "✅ Kernel Image built successfully!"
+            echo "BUILD_STATUS=success" >> $GITHUB_ENV
+          else
+            echo "❌ Build failed!"
+            echo "BUILD_STATUS=failed" >> $GITHUB_ENV
+            exit 1
+          fi
+
+      # ────────────────────────────────────────────
+      # 8. Package with AnyKernel3
+      # ────────────────────────────────────────────
+      - name: Package with AnyKernel3
+        if: env.BUILD_STATUS == 'success'
+        run: |
+          git clone --depth=1 $ANYKERNEL_REPO $GITHUB_WORKSPACE/AnyKernel3
+
+          cd $GITHUB_WORKSPACE/AnyKernel3
+
+          # Clean sample files
+          rm -rf modules patch ramdisk LICENSE README.md
+
+          # Configure anykernel.sh for lisa
+          cat > anykernel.sh << 'EOF'
+          # AnyKernel3 — lisa
+          properties() { '
+          kernel.string=ReSukiSU-lisa
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=lisa
+          device.name2=lisa
+          supported.versions=13-15
+          '; }
+
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          flash_dtbo;
+          EOF
+
+          # Copy kernel image
+          cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image .
+
+          # Copy DTBs if exist
+          find $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/dts -name "*.dtb" \
+            -exec cp {} dtb \; 2>/dev/null || true
+          [ -f $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/dtbo.img ] && \
+            cp $GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/dtbo.img . || true
+
+          # Create flashable zip
+          DATE=$(date +%Y%m%d-%H%M)
+          ZIP_NAME="ReSukiSU-lisa-${DATE}.zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" * -x .git/\*
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          echo "📦 Created: $ZIP_NAME"
+
+      # ────────────────────────────────────────────
+      # 9. Upload artifacts
+      # ────────────────────────────────────────────
+      - name: Upload kernel zip
+        if: env.BUILD_STATUS == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ github.workspace }}/${{ env.ZIP_NAME }}
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ github.workspace }}/kernel/build.log
+          retention-days: 7
+
+      # ────────────────────────────────────────────
+      # 10. (Optional) Create GitHub Release
+      # ────────────────────────────────────────────
+      - name: Create Release
+        if: env.BUILD_STATUS == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: resukisu-lisa-${{ github.run_number }}
+          name: "ReSukiSU Lisa Build #${{ github.run_number }}"
+          body: |
+            ## 📱 ReSukiSU Kernel for Xiaomi 11 Lite 5G NE (lisa)
+
+            | Item | Value |
+            |---|---|
+            | **Kernel** | ${{ env.KERNEL_VERSION }} |
+            | **Device** | lisa (SM7325 / Lahaina) |
+            | **ROM** | PixelExperience 13 |
+            | **ReSukiSU** | ${{ github.event.inputs.resukisu_branch }} |
+            | **Mode** | ${{ github.event.inputs.susfs == 'true' && 'SUSFS' || 'Manual Hook' }} |
+
+            ### ⚡ Flash via Recovery
+            ```
+            adb sideload ${{ env.ZIP_NAME }}
+            ```
+          files: ${{ github.workspace }}/${{ env.ZIP_NAME }}
+          draft: false
+          prerelease: true
