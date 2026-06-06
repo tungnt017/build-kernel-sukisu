@@ -35,7 +35,7 @@ on:
       DISABLE_LTO:
         description: "Disable LTO"
         required: false
-        default: "false"
+        default: "true"
         type: boolean
 
 permissions:
