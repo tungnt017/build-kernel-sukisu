@@ -357,9 +357,10 @@ jobs:
           fi
 
           if [ "${{ github.event.inputs.ENABLE_KPM }}" = "true" ]; then
-            echo "CONFIG_KPM=y" >> out/.config
             echo "CONFIG_KALLSYMS=y" >> out/.config
             echo "CONFIG_KALLSYMS_ALL=y" >> out/.config
+            echo "CONFIG_MODULES=y" >> out/.config
+            echo "CONFIG_MODULE_UNLOAD=y" >> out/.config
           fi
 
           if [ "${{ github.event.inputs.DISABLE_LTO }}" = "true" ]; then
